@@ -8,6 +8,7 @@ import type {
   ToolCall,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
+import { stripDsmlResidue } from "./thinking.js";
 
 /** OpenAI-style tool definition sent to the Qoder API. */
 interface QoderTool {
@@ -34,6 +35,7 @@ type QoderContent = string | Array<QoderTextPart | QoderImagePart>;
 interface QoderMessage {
   role: "user" | "assistant" | "tool" | "system";
   content: QoderContent | null;
+  reasoning_content?: string;
   tool_calls?: QoderToolCall[];
   tool_call_id?: string;
 }
@@ -176,6 +178,7 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
     } else if (msg.role === "assistant") {
       const am = msg as AssistantMessage;
       let content = "";
+      let reasoningContent = "";
       const toolCalls: QoderToolCall[] = [];
 
       if (Array.isArray(am.content)) {
@@ -183,8 +186,10 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
           if (block.type === "text") {
             content += (block as TextContent).text;
           } else if (block.type === "thinking") {
-            // Include thinking tags if reasoning is on
-            content += `<thinking>${(block as ThinkingContent).thinking}</thinking>\n\n`;
+            // Replay reasoning out-of-band. Qoder returns it through
+            // reasoning_content; putting it in visible content can pollute
+            // later turns, and stored text may contain leaked DSML markup.
+            reasoningContent += stripDsmlResidue((block as ThinkingContent).thinking);
           } else if (block.type === "toolCall") {
             const tc = block as ToolCall;
             toolCalls.push({
@@ -222,7 +227,7 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
 
         if (nextToolResultIds.size > 0 || hasSubsequentTurn) {
           validToolCalls = toolCalls.filter((tc) => tc.id && nextToolResultIds.has(tc.id));
-          if (validToolCalls.length === 0 && !content.trim()) {
+          if (validToolCalls.length === 0 && !content.trim() && !reasoningContent.trim()) {
             for (const tc of toolCalls) {
               if (tc.id) droppedToolCallIds.add(tc.id);
             }
@@ -234,12 +239,16 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
       // Qoder's gateway drops assistant messages whose content is null, which
       // orphans the following tool_result and makes dmodel/ultimate upstreams
       // reject the request ("tool must follow a message with tool_calls").
-      // When an assistant turn has tool calls but no text/thinking, inject a
-      // single-space placeholder so the gateway keeps the message.
+      // When an assistant turn has tool calls or reasoning but no visible
+      // text, inject a placeholder so the gateway keeps the message and its
+      // reasoning history.
       const mapped: QoderMessage = {
         role: "assistant",
-        content: content || (validToolCalls.length > 0 ? " " : null),
+        content: content || (validToolCalls.length > 0 || reasoningContent ? " " : null),
       };
+      if (reasoningContent) {
+        mapped.reasoning_content = reasoningContent;
+      }
       if (validToolCalls.length > 0) {
         mapped.tool_calls = validToolCalls;
       }

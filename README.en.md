@@ -13,6 +13,8 @@ A [Pi](https://pi.dev/) extension that connects Pi to Qoder AI (both Global and 
 - **Dynamic Friendly Model IDs**: Uses upstream `display_name` (e.g. `Qwen3.8-Max`, `Lite`, `DeepSeek-V4-Pro`) without hardcoded stale key tables.
 - **10605 Transient Queue Retry**: Automatically retries requests when Qoder servers return `10605` queue busy (up to 4 retries) with server-recommended backoff.
 - **Model Price Factor Display**: Dynamically displays model price multipliers (e.g. `[0.5x]`) in model names.
+- **Actual Credits & Account Quota Tracking**: Captures request-level `credits` and `billable` deductions, tracks session spend accurately, and queries period quotas.
+- **DSML Residue Stripping & Degenerate Turn Protection**: Strips leaked internal DSML tags, replays thinking through out-of-band `reasoning_content`, and retries turns where tools dropped.
 - **Optimized Hot-Path Encoding & Zero-Copy Signatures**: Lookup-table Base64 body encoding and chunked MD5 hashing, eliminating memory spikes on large prompts.
 - **Pi 0.84+ & OMP Compatibility**: Dynamic `qoder-api` registration and adaptive system prompt normalization.
 
@@ -69,6 +71,36 @@ After authenticating account 1, the next slot appears automatically:
 | User Info | `https://openapi.qoder.sh/api/v1/userinfo` | `https://openapi.qoder.com.cn/api/v1/userinfo` |
 | Usage Quota | `https://openapi.qoder.sh/api/v2/quota/usage` | `https://openapi.qoder.com.cn/api/v2/quota/usage` |
 | Chat Gateway | `https://api3.qoder.sh/` | `https://gateway.qoder.com.cn/` |
+
+## Request and Account Credits
+
+The footer displays **actual session deductions in Credits**, aggregated from response `usage.credits` and `usage.billable`. Non-billable requests contribute 0.
+
+Account quota displays the **account-wide period balance** (Personal Quota, Add-on Credits, Org Resource Package).
+
+### Commands & Footer Toggle
+
+Inside Pi:
+
+```text
+/qoder-usage
+/qoder-usage footer on
+/qoder-usage footer off
+```
+
+Or pass the flag when starting Pi:
+
+```bash
+pi --qoder-credit-footer
+```
+
+Enabling this replaces the misleading `$0.000 (sub)` cost footer with labelled session Credits and account quota.
+
+### Offline Preview
+
+```bash
+npm run demo:credits
+```
 
 ## License
 

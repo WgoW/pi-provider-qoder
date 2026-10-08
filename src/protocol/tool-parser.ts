@@ -1,6 +1,6 @@
 export interface ParsedToolCall {
   name: string;
-  arguments: Record<string, any>;
+  arguments: Record<string, unknown>;
 }
 
 export function parseToolCallsFromText(text: string): {
@@ -10,11 +10,11 @@ export function parseToolCallsFromText(text: string): {
   const toolCallRegex = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
   const toolCalls: ParsedToolCall[] = [];
 
-  let match: RegExpExecArray | null;
-  while ((match = toolCallRegex.exec(text)) !== null) {
+  let match = toolCallRegex.exec(text);
+  while (match !== null) {
     let rawContent = match[1].trim();
     let name = "";
-    let args: Record<string, any> = {};
+    let args: Record<string, unknown> = {};
 
     // Strip markdown code block fences if present (e.g. ```json ... ```)
     if (rawContent.startsWith("```")) {
@@ -28,7 +28,7 @@ export function parseToolCallsFromText(text: string): {
       try {
         const parsed = JSON.parse(rawContent);
         name = parsed.name || parsed.function || parsed.tool || "";
-        args = parsed.arguments || parsed.parameters || parsed.args || {};
+        args = (parsed.arguments || parsed.parameters || parsed.args || {}) as Record<string, unknown>;
         if (typeof args === "string") {
           try {
             args = JSON.parse(args);
@@ -36,29 +36,31 @@ export function parseToolCallsFromText(text: string): {
         }
       } catch {}
     } else {
-      const funcMatch = /<function(?:\s+name=|=|\s+)["']?([a-zA-Z0-9_\-]+)["']?>([\s\S]*?)(?:<\/function>|$)/i.exec(
+      const funcMatch = /<function(?:\s+name=|=|\s+)["']?([a-zA-Z0-9_-]+)["']?>([\s\S]*?)(?:<\/function>|$)/i.exec(
         rawContent,
       );
       if (funcMatch) {
         name = funcMatch[1];
         const paramsBlock = funcMatch[2];
-        const paramRegex = /<parameter(?:\s+name=|=|\s+)["']?([a-zA-Z0-9_\-]+)["']?>([\s\S]*?)<\/parameter>/gi;
-        let pMatch: RegExpExecArray | null;
-        while ((pMatch = paramRegex.exec(paramsBlock)) !== null) {
+        const paramRegex = /<parameter(?:\s+name=|=|\s+)["']?([a-zA-Z0-9_-]+)["']?>([\s\S]*?)<\/parameter>/gi;
+        let pMatch = paramRegex.exec(paramsBlock);
+        while (pMatch !== null) {
           const pName = pMatch[1];
-          let pVal: any = pMatch[2].trim();
-          if ((pVal.startsWith("{") && pVal.endsWith("}")) || (pVal.startsWith("[") && pVal.endsWith("]"))) {
+          let pVal: unknown = pMatch[2].trim();
+          const strVal = pMatch[2].trim();
+          if ((strVal.startsWith("{") && strVal.endsWith("}")) || (strVal.startsWith("[") && strVal.endsWith("]"))) {
             try {
-              pVal = JSON.parse(pVal);
+              pVal = JSON.parse(strVal);
             } catch {}
-          } else if (pVal === "true") {
+          } else if (strVal === "true") {
             pVal = true;
-          } else if (pVal === "false") {
+          } else if (strVal === "false") {
             pVal = false;
-          } else if (/^-?\d+(\.\d+)?$/.test(pVal)) {
-            pVal = Number(pVal);
+          } else if (/^-?\d+(\.\d+)?$/.test(strVal)) {
+            pVal = Number(strVal);
           }
           args[pName] = pVal;
+          pMatch = paramRegex.exec(paramsBlock);
         }
       }
     }
@@ -74,6 +76,7 @@ export function parseToolCallsFromText(text: string): {
       }
       toolCalls.push({ name, arguments: args });
     }
+    match = toolCallRegex.exec(text);
   }
 
   const cleanText = text.replace(toolCallRegex, "").trim();

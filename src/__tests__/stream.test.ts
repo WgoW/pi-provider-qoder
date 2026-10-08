@@ -11,6 +11,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { clearQoderModelsMemCache } from "../catalog.js";
+import type { QoderUsage } from "../credits.js";
 import { qoderDecodeBody } from "../protocol/encoding.js";
 import { streamQoder } from "../protocol/stream.js";
 import { loadLiveFixture } from "./live-fixture.js";
@@ -342,6 +343,9 @@ describe("streamQoder", () => {
             // 42 - 5 - 10 = 27. cacheable_tokens is a capacity metric, not a
             // write count, and must not be mapped to cacheWrite.
             prompt_tokens_details: { cacheable_tokens: 99, cache_write_tokens: 10, cached_tokens: 5 },
+            credits: 0.000613272,
+            original_credits: 0.001226544,
+            billable: true,
           },
         }),
       ) +
@@ -359,6 +363,12 @@ describe("streamQoder", () => {
     expect(msg.usage.totalTokens).toBe(49);
     expect(msg.usage.cacheRead).toBe(5);
     expect(msg.usage.cacheWrite).toBe(10);
+    const creditUsage = msg.usage as QoderUsage;
+    expect(creditUsage.credits).toBe(0.000613272);
+    expect(creditUsage.original_credits).toBe(0.001226544);
+    expect(creditUsage.billable).toBe(true);
+    expect(creditUsage.charged_credits).toBe(0.000613272);
+    expect(msg.usage.cost.total).toBe(0);
   });
 
   it("emits a done event with reason=length when finish_reason is length", async () => {
@@ -416,6 +426,42 @@ describe("streamQoder", () => {
       { type: "text", text: "done" },
     ]);
     expect(events.map((event) => event.type)).toContain("thinking_delta");
+  });
+
+  it("reports a degenerate turn instead of a silent stop", async () => {
+    // The gateway failed to parse the model's tool call and leaked its DSML
+    // markup into reasoning_content: the turn carries no text and no tool call,
+    // and finish_reason is still "stop". Reading that as a finished task ended
+    // the agent turn with nothing to show and nothing to retry.
+    const sse =
+      sseEnvelope(chunk({ reasoning_content: "Let me look.</invoke>\n</invoke>\n</invoke>" })) +
+      sseEnvelope(finishChunk("stop")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", reasoning: "high" }));
+
+    const error = events.find((event) => event.type === "error") as { error: AssistantMessage };
+    expect(error, "expected an error event").toBeDefined();
+    expect(error.error.errorMessage).toMatch(/degenerate model output/);
+    expect(events.find((event) => event.type === "done")).toBeUndefined();
+  });
+
+  it("keeps a normal turn and strips the residue from its thinking", async () => {
+    const sse =
+      sseEnvelope(chunk({ reasoning_content: "thinking</invoke>\n</invoke>" })) +
+      sseEnvelope(chunk({ content: "the answer" })) +
+      sseEnvelope(finishChunk("stop")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", reasoning: "high" }));
+
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+    expect(done, "expected a done event").toBeDefined();
+    const thinking = done.message.content.find((block) => block.type === "thinking") as { thinking: string };
+    expect(thinking.thinking).toBe("thinking\n");
+    expect(done.message.content.find((block) => block.type === "text")).toMatchObject({ text: "the answer" });
   });
 
   it("assembles parallel tool calls by their stream indexes", async () => {
