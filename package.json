@@ -45,7 +45,11 @@
     "test:watch": "vitest",
     "prepare": "npm run build",
     "prepublishOnly": "npm run check && npm run build",
-    "demo:credits": "tsx scripts/demo-credit-footer.ts"
+    "demo:credits": "tsx scripts/demo-credit-footer.ts",
+    "test:live": "tsx scripts/record-live-fixtures.ts",
+    "verify:tool-flow": "tsx scripts/verify-tool-call-flow.ts",
+    "fork:diff": "grep -rn \"fork:\" src/ || true",
+    "sync:upstream": "npm run fork:diff && npm run check && npm test"
   },
   "pi": {
     "extensions": [
