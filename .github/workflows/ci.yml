@@ -38,6 +38,16 @@ jobs:
       - name: Build
         run: npm run build
 
+      # The package resolves a bare specifier through "exports" -> dist/index.js
+      # and dist/index.d.ts. A bundle-only build used to leave those declarations
+      # out, which broke `moduleResolution: node16` consumers with TS7016.
+      - name: Verify published entry points resolve
+        run: |
+          node --input-type=module -e 'await import("./dist/index.js")'
+          node -e 'require("./dist/index.js")'
+          test -f dist/index.d.ts
+          node -e 'const p=require("./package.json");const d=p.exports["."];if(!d.types||!d.import||!d.require){process.exit(1)}'
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:

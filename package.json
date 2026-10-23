@@ -3,7 +3,21 @@
   "version": "0.5.0",
   "description": "Pi extension for Qoder AI — with OAuth authentication, COSY signatures and WAF bypass",
   "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./dist/index.js": "./dist/index.js",
+    "./package.json": "./package.json"
+  },
   "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "publishConfig": {
     "access": "public"
   },
@@ -20,7 +34,7 @@
     "README.en.md"
   ],
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:@earendil-works/pi-ai --external:@earendil-works/pi-coding-agent --external:@earendil-works/pi-ai/compat",
+    "build": "npm run build:bundle && npm run build:types",
     "check": "node node_modules/typescript/bin/tsc --noEmit",
     "lint": "node node_modules/@biomejs/biome/bin/biome check .",
     "lint:fix": "node node_modules/@biomejs/biome/bin/biome check --write .",
@@ -29,7 +43,9 @@
     "test:watch": "vitest",
     "prepare": "npm run build",
     "prepublishOnly": "npm run check && npm run build",
-    "demo:credits": "tsx scripts/demo-credit-footer.ts"
+    "demo:credits": "tsx scripts/demo-credit-footer.ts",
+    "build:bundle": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:@earendil-works/pi-ai --external:@earendil-works/pi-coding-agent --external:@earendil-works/pi-ai/compat",
+    "build:types": "node node_modules/typescript/bin/tsc -p tsconfig.build.json"
   },
   "pi": {
     "extensions": [
