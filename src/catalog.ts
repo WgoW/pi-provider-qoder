@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { buildAuthHeaders } from "./cosy.js";
+import { refreshGatewayCosyVersion } from "./cosy-version.js";
 import { getQoderBaseUrl, getQoderModelListURL, getQoderRegionConfig, type QoderMode } from "./region.js";
 
 export const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
@@ -49,6 +50,21 @@ export interface QoderModelEntry {
   [key: string]: unknown;
 }
 
+/**
+ * omp fork's `ThinkingConfig` shape. The fork reads `model.thinking` (not the
+ * `thinkingLevelMap` that earendil pi-ai exposes), and when it is absent omp
+ * fills a generic default ladder (`minimal`..`high`) instead of the model's
+ * real efforts - so `DeepSeek-V4-Pro` would show `low`/`medium` it does not
+ * support. Declared inline because this plugin compiles against
+ * @earendil-works/pi-ai, which has no such field.
+ */
+export interface QoderThinkingConfig {
+  mode: "effort";
+  efforts: readonly ThinkingLevel[];
+  defaultLevel?: ThinkingLevel;
+  requiresEffort?: boolean;
+}
+
 export interface QoderModelDef {
   id: string;
   upstreamKey?: string;
@@ -60,6 +76,8 @@ export interface QoderModelDef {
   reasoning: boolean;
   supportsEffort: boolean;
   thinkingLevelMap?: ThinkingLevelMap;
+  /** omp-only effort metadata; earendil pi-ai ignores it. */
+  thinking?: QoderThinkingConfig;
   input: ("text" | "image")[];
   cost: typeof ZERO_COST;
   contextWindow: number;
@@ -67,6 +85,7 @@ export interface QoderModelDef {
   description?: string;
 }
 
+// fork: model price factor display (upstream has no price_factor handling).
 export function getPriceFactor(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
@@ -109,6 +128,10 @@ function getQoderCachePath(mode: QoderMode): string {
 const CACHE_VERSION = 2;
 
 /** Slot key for a pre-v2 snapshot whose owning account is unknown. */
+// fork: per-account catalogue (upstream keeps a single catalogue per region).
+// Everything from here through checkAccountEntitlement is fork-only: the account
+// key, the per-account slots inside the cache document, and the entitlement
+// verdict used to fail a misrouted pooled request before it costs minutes.
 export const UNKNOWN_ACCOUNT_KEY = "__unknown__";
 
 export interface QoderAccountCatalog {
@@ -772,6 +795,58 @@ export function buildThinkingLevelMap(entry: QoderModelEntry): ThinkingLevelMap 
   return undefined;
 }
 
+/**
+ * Map Qoder's `thinking_config` to omp's `thinking` metadata so omp's effort
+ * picker lists the actual supported levels (it reads `thinking.efforts`, not
+ * `thinkingLevelMap`). Only effort-based models have a meaningful ladder;
+ * toggle-only models (no `efforts`) return undefined so omp falls back to its
+ * generic behavior. earendil pi ignores this field entirely.
+ */
+export function buildThinkingConfig(entry: QoderModelEntry): QoderThinkingConfig | undefined {
+  const tc = entry.thinking_config;
+  const efforts = tc?.enabled?.efforts;
+  if (!efforts || typeof efforts !== "object") return undefined;
+
+  const supported = new Set(Object.keys(efforts));
+  const ordered = PI_THINKING_LEVELS.filter((level) => supported.has(level));
+  if (ordered.length === 0) return undefined;
+
+  const defaultLevel = PI_THINKING_LEVELS.find((level) => efforts[level]?.is_default);
+
+  return {
+    mode: "effort",
+    efforts: ordered,
+    ...(defaultLevel ? { defaultLevel } : {}),
+    // Qoder's catalog marks a `disabled` branch when thinking can be turned
+    // off. Without it reasoning is mandatory upstream, so omp clamps "off" to
+    // the lowest supported effort instead of disabling.
+    requiresEffort: !tc?.disabled,
+  };
+}
+
+/**
+ * Whether the upstream refuses to run a model with thinking disabled.
+ *
+ * Qoder's catalogue shape cannot express this: an always-on model such as
+ * GLM-5.3-Flash and a merely effort-limited model such as Sonus both ship
+ * `thinking_config.enabled.efforts` with no `disabled` branch. Only the curated
+ * seed table records which is which, by pinning `off` to null. Sending
+ * `enable_thinking: false` to an always-on model fails upstream with 1210, while
+ * an effort-limited model accepts it (it just rejects `reasoning_effort: "none"`).
+ *
+ * Exported for the request path, which needs the distinction to pick between
+ * "keep thinking on with the default effort" and "disable, without an effort
+ * signal".
+ */
+// fork: `off: null` marks a model the upstream refuses to run without
+// reasoning. Upstream infers this from the catalogue shape instead, which cannot
+// distinguish an always-on model (GLM-5.3-Flash, error 1210) from a merely
+// effort-limited one (Sonus, rejects reasoning_effort:"none").
+export function isAlwaysThinkingModel(modelId: string, mode: QoderMode): boolean {
+  const seed = (mode === "cn" ? staticCnModels : staticModels).find((model) => model.id === modelId);
+  return seed?.reasoning === true && seed.thinkingLevelMap?.off === null;
+}
+
 /** Look up a catalogue entry by public model id, tolerating v1 raw-key shapes. */
 function findConfigEntry(
   configs: Record<string, QoderModelEntry> | undefined,
@@ -796,13 +871,14 @@ function normalizeCachedModel(
   const display = config?.display_name;
   const staticModel = (mode === "cn" ? staticCnModels : staticModels).find((seed) => seed.upstreamKey === model.id);
   const thinkingLevelMap = model.thinkingLevelMap ?? (config ? buildThinkingLevelMap(config) : undefined);
+  const thinking = model.thinking ?? (config ? buildThinkingConfig(config) : undefined);
   const baseModel = display
-    ? { ...model, id: toQoderModelId(display), name: display, thinkingLevelMap }
+    ? { ...model, id: toQoderModelId(display), name: display, thinkingLevelMap, thinking }
     : staticModel
-      ? { ...model, id: staticModel.id, name: staticModel.name, thinkingLevelMap }
+      ? { ...model, id: staticModel.id, name: staticModel.name, thinkingLevelMap, thinking }
       : model.name
-        ? { ...model, id: toQoderModelId(model.name), thinkingLevelMap }
-        : { ...model, thinkingLevelMap };
+        ? { ...model, id: toQoderModelId(model.name), thinkingLevelMap, thinking }
+        : { ...model, thinkingLevelMap, thinking };
   const priceFactor = model.priceFactor ?? getPriceFactor(config?.price_factor);
   return withPriceFactor(baseModel, priceFactor);
 }
@@ -947,6 +1023,12 @@ export function getCachedModelConfig(modelId: string, mode: QoderMode): QoderMod
       : staticModel.reasoning
         ? {
             enabled: { is_default: true },
+            // A static seed with `reasoning: true` but no explicit level map only
+            // tells us the model reasons, not that thinking is mandatory. Keep
+            // `disabled` present so "off" stays selectable: without it
+            // buildThinkingLevelMap pins `off` to null and the request path would
+            // read the entry as an always-on model it cannot disable.
+            disabled: {},
           }
         : undefined;
 
@@ -1147,6 +1229,9 @@ export async function updateQoderModelsCache(
 ): Promise<boolean> {
   const modelListURL = getQoderModelListURL(mode);
   try {
+    // Refresh the dynamic identity before signing the account-scoped catalog
+    // request, otherwise Qoder may return and cache a reduced model list.
+    if (!process.env.VITEST) await refreshGatewayCosyVersion();
     const headers = buildAuthHeaders(null, modelListURL, {
       userID,
       authToken,

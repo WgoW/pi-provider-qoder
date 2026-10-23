@@ -237,14 +237,25 @@ export class ThinkingTagParser {
 
   private emitText(text: string): void {
     if (!text) return;
-    if (this.textBlockIndex === null) {
+    // Only continue the cached block while it is still the LAST one. Tool calls
+    // (and thinking blocks) get appended to `content` mid-stream, so a cached
+    // index would silently send this text back into an earlier position — the
+    // message then reads "BEFOREAFTER, toolCall" for a stream that produced
+    // text, a call, then more text.
+    const isTrailing = this.textBlockIndex !== null && this.textBlockIndex === this.output.content.length - 1;
+    if (!isTrailing) {
       this.textBlockIndex = this.output.content.length;
       this.output.content.push({ type: "text", text: "" });
       this.stream.push({ type: "text_start", contentIndex: this.textBlockIndex, partial: this.output });
     }
-    const block = this.output.content[this.textBlockIndex] as TextContent;
+    const block = this.output.content[this.textBlockIndex as number] as TextContent;
     block.text += text;
-    this.stream.push({ type: "text_delta", contentIndex: this.textBlockIndex, delta: text, partial: this.output });
+    this.stream.push({
+      type: "text_delta",
+      contentIndex: this.textBlockIndex as number,
+      delta: text,
+      partial: this.output,
+    });
   }
 
   private emitThinking(thinking: string): void {

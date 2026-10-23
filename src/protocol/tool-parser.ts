@@ -28,7 +28,7 @@ export function parseToolCallsFromText(text: string): {
       try {
         const parsed = JSON.parse(rawContent);
         name = parsed.name || parsed.function || parsed.tool || "";
-        args = (parsed.arguments || parsed.parameters || parsed.args || {}) as Record<string, unknown>;
+        args = (parsed.arguments ?? parsed.parameters ?? parsed.args ?? {}) as Record<string, unknown>;
         if (typeof args === "string") {
           try {
             args = JSON.parse(args);
@@ -66,6 +66,11 @@ export function parseToolCallsFromText(text: string): {
     }
 
     if (name) {
+      // `ToolCall.arguments` is a JsonObject; an XML/JSON payload such as
+      // `{"name":"a","arguments":[1,2]}` (or a scalar/null) would violate that
+      // contract and fail tool-argument validation, so a non-object value
+      // degrades to no arguments instead of being passed through.
+      if (args === null || typeof args !== "object" || Array.isArray(args)) args = {};
       // Normalize common parameter aliases for built-in tools
       if ((name === "read" || name === "write" || name === "edit") && !args.path) {
         if (args.file_path) args.path = args.file_path;

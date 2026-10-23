@@ -138,6 +138,29 @@ describe("Qoder model cache", () => {
     expect(cache.models.some((model: { id: string }) => model.id === "auto")).toBe(false);
   });
 
+  // Upstream #43: configs are keyed by display id since the refactor, so a
+  // service-enabled Auto must survive the legacy-fallback cleanup. Checking the
+  // raw upstream key alone dropped an explicitly enabled model.
+  it("keeps Auto when the service explicitly enables it (display-keyed configs)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            chat: [
+              { key: "auto", enable: true, display_name: "Auto" },
+              { key: "lite", enable: true, display_name: "Lite" },
+            ],
+          }),
+      }),
+    );
+
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "global");
+
+    expect(getCachedModels("global").map((model) => model.id)).toEqual(["Auto", "Lite"]);
+  });
+
   it("includes the dynamic Qoder price factor in the model name", async () => {
     vi.stubGlobal(
       "fetch",

@@ -82,7 +82,9 @@ export async function fetchQoderUsageForMode(
       Accept: "application/json",
       "User-Agent": "pi-provider-qoder",
     },
-    signal,
+    // The footer/quota service already passes an abort signal, but a direct
+    // caller may not; default to a bounded request so it cannot hang the UI.
+    signal: signal ?? AbortSignal.timeout(10_000),
   });
 
   if (!response.ok) {

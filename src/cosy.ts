@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { BUNDLED_GATEWAY_COSY_VERSION, getGatewayCosyVersion } from "./cosy-version.js";
 
 const qoderRSAPublicKey = `-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
@@ -10,9 +11,9 @@ MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
 XcW+ML9FoCI6AOvOzwIDAQAB
 -----END PUBLIC KEY-----`;
 
-// Keep the COSY client identity aligned with the current Qoder CLI catalog
-// protocol. Older values cause the model endpoint to return a reduced list.
-export const QODER_GATEWAY_COSY_VERSION = "1.1.38";
+// Bundled fallback; the effective COSY version is refreshed from Qoder's CLI
+// release feed and cached by cosy-version.ts.
+export const QODER_GATEWAY_COSY_VERSION = BUNDLED_GATEWAY_COSY_VERSION;
 export const QODER_OPENAPI_COSY_VERSION = "1.0.1";
 export const QODER_CLIENT_TYPE = "5";
 const QoderDataPolicy = "disagree";
@@ -126,12 +127,13 @@ export function buildAuthHeaders(
 
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const requestId = crypto.randomUUID();
+  const cosyVersion = getGatewayCosyVersion();
 
   const cosyPayload: CosyPayload = {
     version: "v1",
     requestId,
     info: infoB64,
-    cosyVersion: QODER_GATEWAY_COSY_VERSION,
+    cosyVersion,
     ideVersion: "",
   };
 
@@ -165,7 +167,7 @@ export function buildAuthHeaders(
     "Cosy-Key": cosyKey,
     "Cosy-User": creds.userID,
     "Cosy-Date": timestamp,
-    "Cosy-Version": QODER_GATEWAY_COSY_VERSION,
+    "Cosy-Version": cosyVersion,
     "Cosy-Machineid": machineID,
     "Cosy-Machinetoken": machineID,
     "Cosy-Machinetype": QoderMachineTypeMagic,

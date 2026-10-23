@@ -60,6 +60,21 @@ export function getQoderRegionConfig(mode: QoderMode): QoderRegionConfig {
   return QODER_REGIONS[mode];
 }
 
+/**
+ * Whether a provider id belongs to a region.
+ *
+ * The global prefix ("qoder") is a strict prefix of the CN one ("qoder-cn"), so
+ * a naive `id.startsWith(`${prefix}-`)` test matches CN accounts when asked about
+ * global and vice versa. Resolve the region first, then compare — every
+ * region-sensitive lookup (account discovery, re-registration) must use this
+ * instead of hand-rolling the prefix test.
+ */
+export function isProviderOfMode(providerID: string | undefined, mode: QoderMode): boolean {
+  if (!providerID) return false;
+  const cn = providerID === "qoder-cn" || providerID.startsWith("qoder-cn-");
+  return mode === "cn" ? cn : providerID === "qoder" || (providerID.startsWith("qoder-") && !cn);
+}
+
 export function getQoderBaseUrl(mode: QoderMode): string {
   return getQoderRegionConfig(mode).baseUrl;
 }

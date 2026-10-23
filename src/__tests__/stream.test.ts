@@ -8,12 +8,14 @@ import type {
   Context,
   Model,
   ToolCall,
+  TranscriptContext,
 } from "@earendil-works/pi-ai";
+import * as PiAi from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { clearQoderModelsMemCache } from "../catalog.js";
 import type { QoderUsage } from "../credits.js";
 import { qoderDecodeBody } from "../protocol/encoding.js";
-import { streamQoder } from "../protocol/stream.js";
+import { resolveRequestContext, streamQoder } from "../protocol/stream.js";
 import { loadLiveFixture } from "./live-fixture.js";
 
 // Pin the identity so the mocked fetch below only ever serves the chat request.
@@ -90,26 +92,6 @@ const BLOCKED_SSE = sseEnvelope(
   "Not Acceptable",
 );
 
-const QUEUED_SSE = sseEnvelope(
-  {
-    code: "403",
-    message: JSON.stringify({
-      code: "10605",
-      message: JSON.stringify({
-        isQueued: false,
-        modelKey: "qfmodel",
-        queueCount: 0,
-        queueType: "ultrafast",
-        retryAfterSeconds: 0,
-        serviceAvailable: true,
-        waitTime: 0,
-      }),
-    }),
-  },
-  403,
-  "Forbidden",
-);
-
 function mockFetch(body: string): typeof fetch {
   const response = new Response(body, {
     status: 200,
@@ -122,20 +104,23 @@ function makeModel(provider = "qoder", id = "Lite"): Model<Api> {
   return { id, api: "qoder-api" as Api, provider } as Model<Api>;
 }
 
+function makeContext(): Context {
+  return {
+    systemPrompt: "test",
+    messages: [{ role: "user", content: "hi" }],
+    tools: [],
+  } as unknown as Context;
+}
+
 /**
- * Write an account-scoped catalogue for the mocked identity ("test-user") so the
- * entitlement pre-flight has something to check. `servedModelIds` is the raw
- * answer of the account's last `/model/list`.
+ * Fork-only: the entitlement pre-flight reads the account-scoped catalogue, so
+ * these tests need to seed it for the mocked identity ("test-user").
  */
 function accountCatalogPath(): string {
   return join(process.env.HOME || process.env.USERPROFILE || "", ".pi", "agent", "qoder-models-cache.json");
 }
 
-/**
- * Write an account-scoped catalogue for the mocked identity ("test-user") so the
- * entitlement pre-flight has something to check. `servedModelIds` is the raw
- * answer of the account's last `/model/list`.
- */
+/** Seed a v2 multi-account catalogue; `servedModelIds` is this account's answer. */
 function writeAccountCatalog(servedModelIds: string[], modelIds: string[] = servedModelIds): void {
   const configs = Object.fromEntries(
     modelIds.map((id) => [id, { key: id.toLowerCase(), enable: true, display_name: id }]),
@@ -171,12 +156,46 @@ function clearAccountCatalog(): void {
   clearQoderModelsMemCache();
 }
 
-function makeContext(): Context {
-  return {
-    systemPrompt: "test",
+/**
+ * Build the TranscriptContext pi-ai >=0.86 actually hands providers: the system
+ * prompt and tool declarations are folded into a leading system message by
+ * normalizeContext(), and there are NO top-level `systemPrompt` / `tools`
+ * fields. This is the shape that regressed tool binding in 0.4.5.
+ */
+function makeTranscriptContext(): TranscriptContext {
+  return PiAi.normalizeContext({
+    systemPrompt: "you are helpful",
     messages: [{ role: "user", content: "hi" }],
-    tools: [],
-  } as unknown as Context;
+    tools: [
+      {
+        name: "read",
+        description: "read a file",
+        parameters: { type: "object", properties: { path: { type: "string" } } },
+      },
+    ],
+  } as unknown as Context);
+}
+
+/** Reverse the Qoder body encoding and parse the request JSON. */
+interface DecodedQoderBody {
+  tools: Array<{ type: string; function: { name: string; description?: string; parameters?: unknown } }>;
+  messages: Array<{ role: string; content?: unknown }>;
+  [key: string]: unknown;
+}
+
+function decodeQoderBody(init: RequestInit | undefined): DecodedQoderBody {
+  const custom = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
+  const standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const encoded = Buffer.from(init?.body as Uint8Array).toString("utf8");
+  const rearranged = [...encoded]
+    .map((character) => (character === "$" ? "=" : standard[custom.indexOf(character)] || character))
+    .join("");
+  const third = Math.floor(rearranged.length / 3);
+  const base64 =
+    rearranged.slice(rearranged.length - third) +
+    rearranged.slice(third, rearranged.length - third) +
+    rearranged.slice(0, third);
+  return JSON.parse(Buffer.from(base64, "base64").toString("utf8")) as DecodedQoderBody;
 }
 
 async function consume(stream: AssistantMessageEventStream): Promise<AssistantMessageEvent[]> {
@@ -237,6 +256,168 @@ describe("streamQoder", () => {
     expect(body.model_config.key).toBe("lite");
   });
 
+  it("sends full disable signals when thinking is off", async () => {
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    const offOptions = { apiKey: "fake", reasoning: "off" } as unknown as Parameters<typeof streamQoder>[2];
+    await consume(streamQoder(makeModel("qoder", "Ultimate"), makeContext(), offOptions));
+
+    const body = decodeQoderBody(vi.mocked(globalThis.fetch).mock.calls[0][1]);
+    const parameters = body.parameters as Record<string, unknown>;
+    expect(parameters.enable_thinking).toBe(false);
+    expect(parameters.reasoning_effort).toBe("none");
+    expect(body.model_config).toMatchObject({ is_reasoning: false });
+    expect(body.chat_context).toMatchObject({ extra: { modelConfig: { is_reasoning: false } } });
+  });
+
+  it("honors the host's disableReasoning flag as off", async () => {
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    const offOptions = { apiKey: "fake", disableReasoning: true } as unknown as Parameters<typeof streamQoder>[2];
+    await consume(streamQoder(makeModel("qoder", "Ultimate"), makeContext(), offOptions));
+
+    const body = decodeQoderBody(vi.mocked(globalThis.fetch).mock.calls[0][1]);
+    const parameters = body.parameters as Record<string, unknown>;
+    expect(parameters.enable_thinking).toBe(false);
+    expect(parameters.reasoning_effort).toBe("none");
+    expect(body.model_config).toMatchObject({ is_reasoning: false });
+  });
+
+  it("disables thinking when reasoning is omitted (pi's off signal", async () => {
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(streamQoder(makeModel("qoder", "Ultimate"), makeContext(), { apiKey: "fake" }));
+
+    const body = decodeQoderBody(vi.mocked(globalThis.fetch).mock.calls[0][1]);
+    const parameters = body.parameters as Record<string, unknown>;
+    expect(parameters.enable_thinking).toBe(false);
+    expect(parameters.reasoning_effort).toBe("none");
+    expect(body.model_config).toMatchObject({ is_reasoning: false });
+    expect(body.chat_context).toMatchObject({ extra: { modelConfig: { is_reasoning: false } } });
+  });
+
+  // Fork's cache is account-keyed (v2): a bare top-level `configs` slot is not
+  // read at all, so the seed has to look like a real per-account catalogue.
+  function seedModelCache(configs: Record<string, unknown>): string {
+    const path = join(process.env.HOME as string, ".pi", "agent", "qoder-models-cache.json");
+    const models = Object.entries(configs).map(([id, config]) => ({ id, name: id, ...(config as object) }));
+    const slot = { updatedAt: Date.now(), identity: { userID: "test-user" }, models, configs };
+    writeFileSync(
+      path,
+      JSON.stringify({
+        version: 2,
+        models,
+        configs,
+        updatedAt: Date.now(),
+        accounts: { "test-user": slot, "other-user": { ...slot, configs: {}, models: [] } },
+      }),
+    );
+    clearQoderModelsMemCache();
+    return path;
+  }
+
+  function unseedModelCache(path: string): void {
+    rmSync(path, { force: true });
+    clearQoderModelsMemCache();
+  }
+
+  it("sends reasoning_effort none when the catalog advertises a disabled branch", async () => {
+    const path = seedModelCache({
+      Ultimate: {
+        key: "ultimate",
+        display_name: "Ultimate",
+        is_reasoning: true,
+        thinking_config: { disabled: { description: "Disable thinking" }, enabled: { efforts: { high: {} } } },
+      },
+    });
+    try {
+      globalThis.fetch = mockFetch(SUCCESS_SSE);
+      const offOptions = { apiKey: "fake", reasoning: "off" } as unknown as Parameters<typeof streamQoder>[2];
+      await consume(streamQoder(makeModel("qoder", "Ultimate"), makeContext(), offOptions));
+
+      const body = decodeQoderBody(vi.mocked(globalThis.fetch).mock.calls[0][1]);
+      const parameters = body.parameters as Record<string, unknown>;
+      expect(parameters.enable_thinking).toBe(false);
+      expect(parameters.reasoning_effort).toBe("none");
+      expect(body.model_config).toMatchObject({ is_reasoning: false });
+    } finally {
+      unseedModelCache(path);
+    }
+  });
+
+  it("omits reasoning_effort none when the catalog shows no disabled branch", async () => {
+    const path = seedModelCache({
+      Sonus: {
+        key: "smodel",
+        display_name: "Sonus",
+        is_reasoning: true,
+        thinking_config: { enabled: { efforts: { high: {} } } },
+      },
+    });
+    try {
+      globalThis.fetch = mockFetch(SUCCESS_SSE);
+      const offOptions = { apiKey: "fake", reasoning: "off" } as unknown as Parameters<typeof streamQoder>[2];
+      await consume(streamQoder(makeModel("qoder", "Sonus"), makeContext(), offOptions));
+
+      const body = decodeQoderBody(vi.mocked(globalThis.fetch).mock.calls[0][1]);
+      const parameters = body.parameters as Record<string, unknown>;
+      // Upstreams without a disabled branch (e.g. Sonus) reject
+      // reasoning_effort "none" with a 400; the effort signal must be omitted
+      // while the other disable signals still go out.
+      expect(parameters.enable_thinking).toBe(false);
+      expect(parameters.reasoning_effort).toBeUndefined();
+      expect(body.model_config).toMatchObject({ is_reasoning: false });
+      expect(body.chat_context).toMatchObject({ extra: { modelConfig: { is_reasoning: false } } });
+    } finally {
+      unseedModelCache(path);
+    }
+  });
+
+  it("sends exactly one system message when the host also carries system turns", async () => {
+    // The prompt rides as the leading role:system message. Folding every system
+    // message into that one and then sending the raw list again produced
+    // duplicates (top-level prompt + each system turn), and Qoder answers a
+    // repeated system preamble with degraded instruction following.
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    const context = {
+      systemPrompt: "TOP LEVEL PROMPT",
+      messages: [
+        { role: "system", content: "SECTION ONE" },
+        { role: "system", content: "SECTION TWO" },
+        { role: "user", content: "hi" },
+      ],
+      tools: [],
+    } as unknown as Context;
+
+    await consume(streamQoder(makeModel(), context, { apiKey: "fake" }));
+
+    const body = decodeQoderBody(vi.mocked(globalThis.fetch).mock.calls[0][1]);
+    const systemMessages = body.messages.filter((message) => message.role === "system");
+    expect(systemMessages).toHaveLength(1);
+    expect(systemMessages[0].content).toBe("TOP LEVEL PROMPT\n\nSECTION ONE\n\nSECTION TWO");
+    expect(body.messages.map((message) => message.role)).toEqual(["system", "user"]);
+  });
+
+  it("binds tools delivered via the transcript system message (pi-ai >=0.86)", async () => {
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(streamQoder(makeModel(), makeTranscriptContext(), { apiKey: "fake" }));
+
+    const init = vi.mocked(globalThis.fetch).mock.calls[0][1];
+    const body = decodeQoderBody(init);
+
+    // The tool declared on the transcript's leading system message must reach
+    // the request as a structured OpenAI function — not be dropped to `[]`,
+    // which is what made the model free-form ChatML tool calls as plain text.
+    expect(Array.isArray(body.tools)).toBe(true);
+    expect(body.tools).toHaveLength(1);
+    expect(body.tools[0]).toMatchObject({
+      type: "function",
+      function: { name: "read", description: "read a file" },
+    });
+
+    // The system prompt is recovered from the transcript and re-injected as a
+    // leading role:system message (Qoder ignores the top-level `system` field).
+    expect(body.messages[0]).toMatchObject({ role: "system", content: "you are helpful" });
+    expect(body.messages.some((m: { role: string }) => m.role === "user")).toBe(true);
+  });
+
   it("binds chat hosts to provider ids even when only a CN PAT is set", async () => {
     process.env.QODERCN_PERSONAL_ACCESS_TOKEN = "pt-cn-only";
 
@@ -255,6 +436,8 @@ describe("streamQoder", () => {
     );
   });
 
+  // Fork-only: the entitlement pre-flight is this fork's addition (upstream has
+  // no per-account catalogue gate).
   it("fails fast when the account's own catalogue cannot serve the model", async () => {
     writeAccountCatalog(["Lite"]);
     const fetchMock = vi.fn();
@@ -282,6 +465,21 @@ describe("streamQoder", () => {
     clearAccountCatalog();
   });
 
+  // Fork-only: surfaces the truncation as an error rather than a silent stop.
+  it("surfaces premature disconnect as an error when stream ends before [DONE]", async () => {
+    // If the server terminates the connection or times out without sending [DONE],
+    // it must surface as an error event, not be swallowed as a successful stop.
+    const truncatedSse = sseEnvelope(chunk({ content: "thinking...", role: "assistant" }));
+    globalThis.fetch = mockFetch(truncatedSse);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const err = events.find((e) => e.type === "error") as { error: AssistantMessage } | undefined;
+    expect(err, "expected an error event").toBeDefined();
+    expect(err?.error.stopReason).toBe("error");
+    expect(err?.error.errorMessage).toMatch(/disconnected prematurely/i);
+    expect(events.find((e) => e.type === "done")).toBeUndefined();
+  });
+
   it("surfaces an upstream 406 'Session blocked' as an error event, not a silent stop", async () => {
     globalThis.fetch = mockFetch(BLOCKED_SSE);
     const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
@@ -294,22 +492,6 @@ describe("streamQoder", () => {
     expect(msg.errorMessage).toMatch(/Session blocked/);
     expect(msg.errorMessage).toMatch(/406/);
     // Must NOT emit a silent done/stop.
-    expect(events.find((e) => e.type === "done")).toBeUndefined();
-  });
-
-  it("surfaces premature disconnect as an error when stream ends before [DONE]", async () => {
-    // If the server terminates the connection or times out without sending [DONE],
-    // it must surface as an error event, not be swallowed as a successful stop.
-    const truncatedSse = sseEnvelope(chunk({ content: "thinking...", role: "assistant" }));
-    globalThis.fetch = mockFetch(truncatedSse);
-    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
-    const events = await consume(stream);
-
-    const err = events.find((e) => e.type === "error");
-    expect(err, "expected an error event").toBeDefined();
-    const msg = (err as { error: AssistantMessage }).error;
-    expect(msg.stopReason).toBe("error");
-    expect(msg.errorMessage).toMatch(/disconnected prematurely/i);
     expect(events.find((e) => e.type === "done")).toBeUndefined();
   });
 
@@ -333,6 +515,9 @@ describe("streamQoder", () => {
           id: "chatcmpl-abc123",
           model: "qmodel_latest",
           usage: {
+            credits: 0.000613272,
+            original_credits: 0.001226544,
+            billable: true,
             prompt_tokens: 42,
             completion_tokens: 7,
             total_tokens: 49,
@@ -343,9 +528,6 @@ describe("streamQoder", () => {
             // 42 - 5 - 10 = 27. cacheable_tokens is a capacity metric, not a
             // write count, and must not be mapped to cacheWrite.
             prompt_tokens_details: { cacheable_tokens: 99, cache_write_tokens: 10, cached_tokens: 5 },
-            credits: 0.000613272,
-            original_credits: 0.001226544,
-            billable: true,
           },
         }),
       ) +
@@ -508,10 +690,40 @@ describe("streamQoder", () => {
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
     const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
 
+    // Order must match the stream: the post-call text cannot be folded back
+    // into the block that precedes the call. A cached text-block index used to
+    // do exactly that, so consumers rendering by `contentIndex` saw "before
+    // after" placed ahead of the tool call that actually came first.
     expect(done.message.content).toEqual([
-      { type: "text", text: "before after" },
+      { type: "text", text: "before" },
       { type: "toolCall", id: "call_1", name: "lookup", arguments: {} },
+      { type: "text", text: " after" },
     ]);
+  });
+
+  it("keeps content order when text follows a tool call", async () => {
+    // `content` must match stream order: the post-call text goes into its own
+    // block AFTER the call. The cached text-block index used to append it to the
+    // pre-call block, so a consumer rendering by `contentIndex` displayed text
+    // that the model emitted later ahead of the tool call.
+    const sse =
+      sseEnvelope(chunk({ content: "before" })) +
+      sseEnvelope(chunk({ tool_calls: [{ index: 0, id: "call_1", function: { name: "lookup", arguments: "{}" } }] })) +
+      sseEnvelope(chunk({ content: "after" })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+
+    expect(done.message.content.map((block) => block.type)).toEqual(["text", "toolCall", "text"]);
+    // Every emitted event must address the block it actually belongs to.
+    for (const event of events) {
+      if (event.type !== "toolcall_start" && event.type !== "text_start") continue;
+      const kind = event.type === "toolcall_start" ? "toolCall" : "text";
+      expect(done.message.content[(event as { contentIndex: number }).contentIndex].type, event.type).toBe(kind);
+    }
   });
 
   it("emits a tool call that arrives with no arguments", async () => {
@@ -579,28 +791,6 @@ describe("streamQoder", () => {
     expect(msg.content.find((c) => c.type === "toolCall")).toBeUndefined();
     expect(msg.stopReason).toBe("stop");
   });
-  it("retries a transient 10605 queue response", async () => {
-    const responses = [QUEUED_SSE, SUCCESS_SSE].map(
-      (body) => new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } }),
-    );
-    const chatCalls: string[] = [];
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.includes("/userinfo")) {
-        return new Response(JSON.stringify({}), { status: 200, headers: { "content-type": "application/json" } });
-      }
-      chatCalls.push(url);
-      return responses.shift() as Response;
-    });
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-
-    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
-    const events = await consume(stream);
-
-    expect(chatCalls).toHaveLength(2);
-    expect(events.some((event) => event.type === "error")).toBe(false);
-    expect(events.some((event) => event.type === "done")).toBe(true);
-  });
   it("finishes when the gateway sends [DONE] but keeps the body open", async () => {
     // Qoder's gateway does not always close the HTTP body after the sentinel.
     // The read loop used to keep awaiting reader.read() until the socket went
@@ -655,6 +845,7 @@ describe("streamQoder", () => {
     const text = msg.content.find((c) => c.type === "text");
     expect(text && "text" in text ? text.text : "").toBe("hi");
   });
+
   it("reports aborted when the request is cancelled before streaming starts", async () => {
     const controller = new AbortController();
     globalThis.fetch = vi.fn(
@@ -681,6 +872,7 @@ describe("streamQoder", () => {
     expect(events.find((event) => event.type === "done")).toBeUndefined();
   });
 
+  // Fork-only: the cached catalog is authoritative for the effort sent upstream.
   it("clamps and falls back unsupported reasoning effort to a valid upstream effort", async () => {
     globalThis.fetch = mockFetch(SUCCESS_SSE);
     // Request GLM-5.3-Flash with medium (upstream only supports high / max)
@@ -721,6 +913,7 @@ describe("streamQoder", () => {
     expect(["high", "max"]).toContain(parsed.parameters.reasoning_effort);
   });
 
+  // Fork-only: recovers XML `<tool_call>` markup emitted as plain text.
   it("parses XML <tool_call> tags from text stream as real tool calls", async () => {
     const sse =
       sseEnvelope(
@@ -737,16 +930,504 @@ describe("streamQoder", () => {
     const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
     const events = await consume(stream);
 
-    const done = events.find((e) => e.type === "done");
-    const msg = (done as { message: AssistantMessage }).message;
+    const done = events.find((e) => e.type === "done") as { message: AssistantMessage } | undefined;
+    const msg = done?.message;
 
-    expect(msg.stopReason).toBe("toolUse");
-    const toolCall = msg.content.find((c) => c.type === "toolCall") as ToolCall | undefined;
+    expect(msg?.stopReason).toBe("toolUse");
+    const toolCall = msg?.content.find((c) => c.type === "toolCall") as ToolCall | undefined;
     expect(toolCall).toBeDefined();
     expect(toolCall?.name).toBe("read");
     expect(toolCall?.arguments.path).toBe("/test/file.md");
 
-    const text = msg.content.find((c) => c.type === "text") as { text: string } | undefined;
+    const text = msg?.content.find((c) => c.type === "text") as { text: string } | undefined;
     expect(text?.text).toBe("Let me read the file.");
+  });
+});
+
+// Synthetic wire inputs only; snapshots are copied synchronously at push(),
+// because SDK partial messages are live references, not historical snapshots.
+describe("streamQoder response aggregation contract", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  function tool(index: number | undefined, id?: string, name?: string, args?: string): object {
+    return { index, id, function: { name, arguments: args } };
+  }
+
+  async function run(deltas: object[], finish = "tool_calls", byteSize?: number) {
+    const snapshots: AssistantMessageEvent[] = [];
+    const StreamCtor = (PiAi as unknown as { AssistantMessageEventStream: new () => AssistantMessageEventStream })
+      .AssistantMessageEventStream;
+    const prototype = StreamCtor.prototype;
+    const push = prototype.push;
+    vi.spyOn(prototype, "push").mockImplementation(function (this: AssistantMessageEventStream, event) {
+      snapshots.push(structuredClone(event) as AssistantMessageEvent);
+      return push.call(this, event);
+    });
+    const frames = [...deltas.map((delta) => sseEnvelope(chunk(delta))), sseEnvelope(finishChunk(finish)), DONE_SSE];
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (byteSize) {
+          const bytes = encoder.encode(frames.join(""));
+          for (let offset = 0; offset < bytes.length; offset += byteSize) {
+            controller.enqueue(bytes.slice(offset, offset + byteSize));
+          }
+        } else {
+          for (const frame of frames) controller.enqueue(encoder.encode(frame));
+        }
+        // Leave open: DONE and all error paths must release the reader.
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    globalThis.fetch = vi.fn(async () => new Response(body)) as unknown as typeof fetch;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "synthetic" }));
+    return { events, snapshots, body, cancelled };
+  }
+
+  type Result = Awaited<ReturnType<typeof run>>;
+  function success(
+    result: Result,
+    expected: Array<{ id: string; name: string; arguments: object }>,
+    reason = "toolUse",
+  ) {
+    expect(result.events.filter((event) => event.type === "error")).toEqual([]);
+    const done = result.events.filter((event) => event.type === "done");
+    expect(done).toHaveLength(1);
+    if (done[0].type !== "done") throw new Error("missing done");
+    expect(done[0].message.stopReason).toBe(reason);
+    expect(done[0].reason).toBe(reason);
+    expect(done[0].message.content.filter((block) => block.type === "toolCall")).toEqual(
+      expected.map((call) => ({ type: "toolCall", ...call })),
+    );
+    expect(result.snapshots[0].type).toBe("start");
+    expect(result.snapshots.filter((event) => event.type === "toolcall_start")).toHaveLength(expected.length);
+    const ends = result.snapshots.filter((event) => event.type === "toolcall_end");
+    expect(ends.map((event) => event.toolCall)).toEqual(expected.map((call) => ({ type: "toolCall", ...call })));
+    for (const event of result.snapshots) {
+      if (event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end") {
+        expect(event.partial.content[event.contentIndex]?.type).toBe("toolCall");
+        if (event.type === "toolcall_end") expect(event.partial.content[event.contentIndex]).toEqual(event.toolCall);
+      }
+    }
+    expect(result.cancelled).toBe(true);
+  }
+
+  function failure(result: Result, category: RegExp) {
+    expect(result.events.filter((event) => event.type === "done")).toEqual([]);
+    expect(result.events.filter((event) => event.type === "error")).toHaveLength(1);
+    const error = result.events.find((event) => event.type === "error");
+    expect(error?.reason).toBe("error");
+    expect(error?.error.stopReason).toBe("error");
+    expect(error?.error.errorMessage).toMatch(category);
+    expect(error?.error.errorMessage).not.toMatch(/server error|synthetic-private/);
+    expect(result.snapshots.filter((event) => event.type === "toolcall_end")).toEqual([]);
+    expect(result.cancelled).toBe(true);
+  }
+
+  const a = { id: "synthetic_a", name: "lookup", arguments: { path: "/a" } };
+  const b = { id: "synthetic_b", name: "lookup", arguments: { path: "/b" } };
+
+  it("C01 preserves stable parallel indexes and ID-less continuations", async () => {
+    const result = await run([
+      { tool_calls: [tool(7, a.id, a.name, '{"path":'), tool(2, b.id, b.name, '{"path":')] },
+      { tool_calls: [tool(2, undefined, undefined, '"/b"}'), tool(7, undefined, undefined, '"/a"}')] },
+    ]);
+    success(result, [a, b]);
+    expect(result.snapshots.filter((event) => event.type === "toolcall_delta")).toHaveLength(4);
+  });
+
+  it("C01 positive control preserves ordinary stable parallel indexes", async () => {
+    success(
+      await run([
+        { tool_calls: [tool(0, a.id, a.name, '{"path":'), tool(1, b.id, b.name, '{"path":')] },
+        { tool_calls: [tool(1, undefined, undefined, '"/b"}'), tool(0, undefined, undefined, '"/a"}')] },
+      ]),
+      [a, b],
+    );
+  });
+
+  it("C02 C03 separates same-index same-name IDs after a complete object", async () => {
+    success(
+      await run([
+        { tool_calls: [tool(0, a.id, a.name, '{"path":"/a"}')] },
+        { tool_calls: [tool(0, b.id, b.name, '{"path":')] },
+        { tool_calls: [tool(0, undefined, undefined, '"/b"}')] },
+      ]),
+      [a, b],
+    );
+  });
+
+  it("C04 routes repeated IDs across index changes without duplicating blocks", async () => {
+    success(
+      await run([
+        { tool_calls: [tool(3, a.id, a.name, '{"path":')] },
+        { tool_calls: [tool(9, a.id, a.name, '"/a"}')] },
+        { tool_calls: [tool(3, a.id, undefined, " \n")] },
+      ]),
+      [a],
+    );
+  });
+
+  it.each(["arguments-first", "name-first"])("C05 binds a unique provisional state: %s", async (order) => {
+    const prefix = order === "arguments-first" ? tool(4, undefined, undefined, '{"path":') : tool(4, undefined, a.name);
+    const middle =
+      order === "arguments-first" ? tool(4, a.id, a.name, '"/a"}') : tool(4, undefined, undefined, '{"path":"/a"}');
+    const result = await run([
+      { content: "prefix" },
+      { tool_calls: [prefix] },
+      { tool_calls: [middle] },
+      { tool_calls: [tool(4, a.id, a.name)] },
+    ]);
+    success(result, [a]);
+    const deltas = result.snapshots.filter((event) => event.type === "toolcall_delta");
+    expect(deltas.map((event) => event.delta).join("")).toBe('{"path":"/a"}');
+  });
+
+  it.each([
+    ["missing ID", [tool(0, undefined, "lookup", "{}")], /identity|unresolved|missing.*id/i],
+    ["missing name", [tool(0, a.id, undefined, "{}")], /identity|unresolved|missing.*name/i],
+    ["name conflict", [tool(0, a.id, "lookup", "{"), tool(0, a.id, "other", "}")], /identity|conflict/i],
+  ] as const)("C06 rejects %s", async (_label, calls, category) => {
+    failure(await run(calls.map((call) => ({ tool_calls: [call] }))), category);
+  });
+
+  it("C07 routes explicitly identified interleaving on a reused index", async () => {
+    success(
+      await run([
+        { tool_calls: [tool(0, a.id, a.name, '{"path":'), tool(0, b.id, b.name, '{"path":')] },
+        { tool_calls: [tool(0, a.id, undefined, '"/a"}'), tool(0, b.id, undefined, '"/b"}')] },
+      ]),
+      [a, b],
+    );
+  });
+
+  it.each(["{", ""])("C08 rejects ambiguous continuation even if later ID arrives (prefix=%j)", async (prefix) => {
+    failure(
+      await run([
+        { tool_calls: [tool(0, a.id, a.name, prefix), tool(0, b.id, b.name, prefix)] },
+        { tool_calls: [tool(0, undefined, undefined, '"synthetic-private":1}')] },
+        { tool_calls: [tool(0, b.id, undefined, "{}")] },
+      ]),
+      /ambiguous tool-call continuation/i,
+    );
+  });
+
+  it("C09 continues a unique call without index", async () => {
+    success(
+      await run([
+        { tool_calls: [tool(5, a.id, a.name, '{"path":')] },
+        { tool_calls: [tool(undefined, undefined, undefined, '"/a"}')] },
+      ]),
+      [a],
+    );
+  });
+
+  it("C09 routes explicit IDs without indexes among parallel calls", async () => {
+    success(
+      await run([
+        { tool_calls: [tool(undefined, a.id, a.name, '{"path":'), tool(undefined, b.id, b.name, '{"path":')] },
+        { tool_calls: [tool(undefined, b.id, undefined, '"/b"}'), tool(undefined, a.id, undefined, '"/a"}')] },
+      ]),
+      [a, b],
+    );
+  });
+
+  it("C09 rejects absent index with multiple candidates", async () => {
+    failure(
+      await run([
+        { tool_calls: [tool(0, a.id, a.name, "{"), tool(1, b.id, b.name, "{")] },
+        { tool_calls: [tool(undefined, undefined, undefined, "}")] },
+      ]),
+      /ambiguous tool-call continuation/i,
+    );
+  });
+
+  it.each([undefined, "", "{}"])("C10 preserves independent no-argument calls (%j)", async (args) => {
+    success(await run([{ tool_calls: [tool(0, a.id, a.name, args), tool(0, b.id, b.name, args)] }]), [
+      { ...a, arguments: {} },
+      { ...b, arguments: {} },
+    ]);
+  });
+
+  it.each(["{", '{"path":', "{}{}", "{}garbage", "[]", "null", "1", '"text"', "true", " \n\t", '{"x":}', '{"x":1,}'])(
+    "C11 rejects non-object or invalid nonempty JSON %j without fallback",
+    async (args) => {
+      failure(await run([{ tool_calls: [tool(0, a.id, a.name, args)] }]), /json|argument|object|incomplete/i);
+    },
+  );
+
+  it("C11 accepts trailing whitespace on one stable object", async () => {
+    success(
+      await run([
+        { tool_calls: [tool(0, a.id, a.name, '{"path":"/a"}')] },
+        { tool_calls: [tool(0, undefined, undefined, " \n\t")] },
+      ]),
+      [a],
+    );
+  });
+
+  it("C12 ignores a completely empty placeholder", async () => {
+    const result = await run([{ content: "synthetic text" }, { tool_calls: [tool(0)] }], "stop");
+    success(result, [], "stop");
+    const done = result.events.find((event) => event.type === "done");
+    expect(done?.message.content).toEqual([{ type: "text", text: "synthetic text" }]);
+  });
+
+  it.each([false, true])(
+    "C13 preserves block identity after tag thinking insertion (API reasoning=%s)",
+    async (apiReasoning) => {
+      const result = await run([
+        ...(apiReasoning ? [{ reasoning_content: "api thought" }] : []),
+        { content: "before" },
+        { tool_calls: [tool(0, a.id, a.name, '{"path":')] },
+        { content: "<thinking>tag thought</thinking>after" },
+        { tool_calls: [tool(0, a.id, undefined, '"/a"}')] },
+      ]);
+      success(result, [a]);
+      const done = result.events.find((event) => event.type === "done");
+      expect(done?.message.content.filter((block) => block.type !== "toolCall")).toEqual([
+        ...(apiReasoning ? [{ type: "thinking", thinking: "api thought" }] : []),
+        { type: "thinking", thinking: "tag thought" },
+        { type: "text", text: "before" },
+        { type: "text", text: "after" },
+      ]);
+      for (const event of result.snapshots) {
+        if (event.type === "toolcall_start" || event.type === "toolcall_delta") {
+          expect(event.partial.content[event.contentIndex]).toMatchObject({ type: "toolCall", id: a.id, name: a.name });
+        }
+      }
+      const first = result.snapshots.find((event) => event.type === "toolcall_start");
+      expect(
+        first?.partial.content.some((block) => block.type === "thinking" && block.thinking === "tag thought"),
+      ).toBe(false);
+    },
+  );
+
+  it.each([undefined, 100000, 17, 1])("C14 preserves UTF-8 and JSON escapes with byte size %s", async (size) => {
+    const args = { path: "/合成/😀", value: 'quote" slash\\ newline\n } {' };
+    const json = JSON.stringify(args);
+    const split = json.indexOf('\\"') + 1;
+    success(
+      await run(
+        [
+          { tool_calls: [tool(0, a.id, a.name, json.slice(0, split))] },
+          { tool_calls: [tool(0, undefined, undefined, json.slice(split))] },
+        ],
+        "tool_calls",
+        size,
+      ),
+      [{ ...a, arguments: args }],
+    );
+  });
+
+  it("C15 validates the whole batch before any successful toolcall_end", async () => {
+    failure(
+      await run([{ tool_calls: [tool(0, a.id, a.name, "{}"), tool(1, b.id, b.name, '{"synthetic-private":')] }]),
+      /json|argument|incomplete/i,
+    );
+  });
+
+  it("C15 preserves length for a complete tool object", async () => {
+    success(await run([{ tool_calls: [tool(0, a.id, a.name, '{"path":"/a"}')] }], "length"), [a], "length");
+  });
+
+  it("C15 rejects truncated tool JSON even with length", async () => {
+    failure(await run([{ tool_calls: [tool(0, a.id, a.name, '{"path":')] }], "length"), /json|argument|incomplete/i);
+  });
+
+  it("C12 C05 initializes provisional arguments after empty placeholders and tag thinking", async () => {
+    const result = await run([
+      { tool_calls: [tool(0)] },
+      { content: "<thinking>initial thought</thinking>ready" },
+      { tool_calls: [tool(0, undefined, undefined, '{"path":')] },
+      { tool_calls: [tool(0, a.id, a.name, '"/a"}')] },
+    ]);
+    success(result, [a]);
+    const done = result.events.find((event) => event.type === "done");
+    expect(done?.message.content.filter((block) => block.type !== "toolCall")).toEqual([
+      { type: "thinking", thinking: "initial thought" },
+      { type: "text", text: "ready" },
+    ]);
+    const deltas = result.snapshots.filter((event) => event.type === "toolcall_delta");
+    expect(deltas.map((event) => event.delta).join("")).toBe('{"path":"/a"}');
+  });
+
+  it("C12 C06 rejects unresolved argument-only state after an empty placeholder", async () => {
+    const result = await run([{ tool_calls: [tool(0)] }, { tool_calls: [tool(0, undefined, undefined, "{}")] }]);
+    failure(result, /identity|unresolved|missing.*id/i);
+    expect(
+      result.snapshots.filter((event) => event.type === "toolcall_start" || event.type === "toolcall_delta"),
+    ).toEqual([]);
+  });
+
+  it("C07 C02 restores a unique index candidate after retiring completed interleaved calls", async () => {
+    const c = { id: "synthetic_c", name: "lookup", arguments: { path: "/c" } };
+    success(
+      await run([
+        { tool_calls: [tool(0, a.id, a.name, '{"path":'), tool(0, b.id, b.name, '{"path":')] },
+        { tool_calls: [tool(0, a.id, undefined, '"/a"}'), tool(0, b.id, undefined, '"/b"}')] },
+        { tool_calls: [tool(0, c.id, c.name, '{"path":')] },
+        { tool_calls: [tool(0, undefined, undefined, '"/c"}')] },
+      ]),
+      [a, b, c],
+    );
+  });
+
+  it("C04 C09 re-registers a retired ID before subsequent index and global continuations", async () => {
+    const c = { id: "synthetic_c", name: "lookup", arguments: { path: "/c" } };
+    success(
+      await run([
+        { tool_calls: [tool(0, a.id, a.name, '{"path":"/a"}')] },
+        { tool_calls: [tool(0, b.id, b.name, '{"path":"/b"}')] },
+        { tool_calls: [tool(0, a.id, undefined, " ")] },
+        { tool_calls: [tool(0, c.id, c.name, '{"path":')] },
+        { tool_calls: [tool(0, undefined, undefined, '"/c"}')] },
+        { tool_calls: [tool(undefined, undefined, undefined, "\n")] },
+      ]),
+      [a, b, c],
+    );
+  });
+
+  it("C05 C02 retires an already-closed provisional after its ID arrives", async () => {
+    success(
+      await run([
+        { tool_calls: [tool(0, undefined, undefined, '{"path":"/a"}')] },
+        { tool_calls: [tool(0, a.id, a.name)] },
+        { tool_calls: [tool(0, b.id, b.name, '{"path":')] },
+        { tool_calls: [tool(0, undefined, undefined, '"/b"}')] },
+      ]),
+      [a, b],
+    );
+  });
+
+  it("C04 C05 binds a provisional uniquely after retiring a completed alias from its index", async () => {
+    success(
+      await run([
+        { tool_calls: [tool(0, a.id, a.name, '{"path":"/a"}')] },
+        { tool_calls: [tool(1, undefined, undefined, '{"path":')] },
+        { tool_calls: [tool(1, a.id, undefined, " ")] },
+        { tool_calls: [tool(1, b.id, b.name)] },
+        { tool_calls: [tool(1, undefined, undefined, '"/b"}')] },
+      ]),
+      [a, b],
+    );
+  });
+
+  it("C04 C09 keeps a globally reactivated retired ID in ambiguity checks", async () => {
+    failure(
+      await run([
+        { tool_calls: [tool(0, a.id, a.name, "{}")] },
+        { tool_calls: [tool(0, b.id, b.name, "{}")] },
+        { tool_calls: [tool(undefined, a.id, undefined, " ")] },
+        { tool_calls: [tool(0, "synthetic_c", "lookup", "{}")] },
+        { tool_calls: [tool(undefined, undefined, undefined, " ")] },
+      ]),
+      /ambiguous tool-call continuation/i,
+    );
+  });
+
+  it("C15 aborts an in-progress tool response and releases its reader", async () => {
+    const controller = new AbortController();
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(target) {
+        target.enqueue(new TextEncoder().encode(sseEnvelope(chunk({ tool_calls: [tool(0, a.id, a.name, "{")] }))));
+        controller.signal.addEventListener("abort", () => target.error(new DOMException("Aborted", "AbortError")));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    globalThis.fetch = vi.fn(async () => new Response(body)) as unknown as typeof fetch;
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "synthetic", signal: controller.signal });
+    const events: AssistantMessageEvent[] = [];
+    for await (const event of stream) {
+      events.push(event);
+      if (event.type === "toolcall_delta") controller.abort();
+    }
+    expect(events.filter((event) => event.type === "done" || event.type === "toolcall_end")).toEqual([]);
+    const errors = events.filter((event) => event.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0].error.stopReason).toBe("aborted");
+    // An errored ReadableStream need not call its underlying cancel callback,
+    // but parser ownership of the reader must still be released.
+    expect(cancelled || !body.locked).toBe(true);
+  });
+});
+
+describe("resolveRequestContext", () => {
+  const flatContext = {
+    systemPrompt: "legacy prompt",
+    messages: [{ role: "user", content: "hi" }],
+    tools: [{ name: "bash", description: "run a command", parameters: { type: "object", properties: {} } }],
+  } as unknown as Context;
+
+  it("falls back to flat Context fields when transcript helpers are absent (pi-ai <=0.85)", () => {
+    // An empty helpers object simulates the pi-ai 0.85 namespace, which exports
+    // none of the transcript helpers. The provider must still bind tools and the
+    // system prompt from the legacy top-level Context fields instead of crashing
+    // or shipping `tools: []`.
+    const resolved = resolveRequestContext({}, flatContext);
+    expect(resolved.systemText).toBe("legacy prompt");
+    expect(resolved.tools.map((t) => t.name)).toEqual(["bash"]);
+    expect(resolved.messages).toBe(flatContext.messages);
+  });
+
+  it("treats a partial transcript toolkit as legacy (defensive: missing getSystemMessageText)", () => {
+    // All transcript helpers except getSystemMessageText. Without the full set we
+    // cannot reconstruct the system prompt from the transcript, so the resolver
+    // must fall back to the flat Context fields rather than drop the prompt.
+    const partial = {
+      collapseSystemMessages: PiAi.collapseSystemMessages,
+      getCurrentTools: PiAi.getCurrentTools,
+      getInitialSystemMessage: PiAi.getInitialSystemMessage,
+      withoutInitialSystemMessage: PiAi.withoutInitialSystemMessage,
+    };
+    const resolved = resolveRequestContext(partial, flatContext);
+    expect(resolved.systemText).toBe("legacy prompt");
+    expect(resolved.tools.map((t) => t.name)).toEqual(["bash"]);
+  });
+
+  it("keeps flat Context tools when the host exports the toolkit but passes a flat Context (omp 18.12.x)", () => {
+    // omp 18.12.3 exports the whole transcript toolkit to legacy extensions yet
+    // still calls `stream` with `systemPrompt` / `tools` unfolded. Replaying that
+    // transcript finds no system message, so the resolver must use the flat
+    // fields instead of shipping `tools: []` (the model then invents DSML text
+    // markup and every turn ends empty).
+    const resolved = resolveRequestContext(PiAi, flatContext);
+    expect(resolved.systemText).toBe("legacy prompt");
+    expect(resolved.tools.map((t) => t.name)).toEqual(["bash"]);
+    expect(resolved.messages).toBe(flatContext.messages);
+  });
+
+  it("keeps the flat prompt when a flat Context carries no tools", () => {
+    const noTools = { ...flatContext, tools: [] } as unknown as Context;
+    const resolved = resolveRequestContext(PiAi, noTools);
+    expect(resolved.systemText).toBe("legacy prompt");
+    expect(resolved.tools).toEqual([]);
+    expect(resolved.messages).toBe(noTools.messages);
+  });
+
+  it("resolves tools + prompt from the transcript when helpers are present (pi-ai >=0.86)", () => {
+    const transcript = PiAi.normalizeContext({
+      systemPrompt: "you are helpful",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ name: "read", description: "read a file", parameters: { type: "object", properties: {} } }],
+    } as unknown as Context);
+
+    const resolved = resolveRequestContext(PiAi, transcript);
+    expect(resolved.tools.map((t) => t.name)).toEqual(["read"]);
+    expect(resolved.systemText).toBe("you are helpful");
+    // The consolidated leading system message is dropped from the conversation
+    // (reqBody re-injects systemText as its own role:system message).
+    expect(resolved.messages.some((m) => m.role === "system")).toBe(false);
+    expect(resolved.messages.some((m) => m.role === "user")).toBe(true);
   });
 });

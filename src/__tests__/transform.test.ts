@@ -228,7 +228,11 @@ describe("transformMessagesForQoder", () => {
   });
 
   it("handles toolResult messages", () => {
+    // The assistant turn declaring the call must be present: a `tool` message
+    // whose id no preceding assistant turn declared is an orphan the upstream
+    // rejects ("tool must follow a message with tool_calls").
     const msgs = [
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "read", arguments: {} }] },
       {
         role: "toolResult",
         toolCallId: "call_1",
@@ -236,7 +240,7 @@ describe("transformMessagesForQoder", () => {
       },
     ] as unknown as Message[];
     const result = transformMessagesForQoder(msgs);
-    expect(result[0]).toEqual({
+    expect(result[1]).toEqual({
       role: "tool",
       tool_call_id: "call_1",
       content: "file content here",
@@ -249,6 +253,7 @@ describe("transformMessagesForQoder", () => {
     // follow as a user message; before this it was dropped and the model saw
     // only the note, then reported that it could not see images.
     const msgs = [
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "read", arguments: {} }] },
       {
         role: "toolResult",
         toolCallId: "call_1",
@@ -260,14 +265,14 @@ describe("transformMessagesForQoder", () => {
     ] as unknown as Message[];
     const result = transformMessagesForQoder(msgs);
 
-    expect(result).toHaveLength(2);
-    expect(result[0]).toEqual({
+    expect(result).toHaveLength(3);
+    expect(result[1]).toEqual({
       role: "tool",
       tool_call_id: "call_1",
       content: "Read image file [image/png]",
     });
-    expect(result[1].role).toBe("user");
-    const parts = result[1].content as Array<{ type: string; text?: string; image_url?: { url: string } }>;
+    expect(result[2].role).toBe("user");
+    const parts = result[2].content as Array<{ type: string; text?: string; image_url?: { url: string } }>;
     expect(parts[0]).toEqual({
       type: "text",
       text: "[1 image returned by the previous tool call]",
@@ -280,6 +285,7 @@ describe("transformMessagesForQoder", () => {
 
   it("forwards several images from one tool call", () => {
     const msgs = [
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "read", arguments: {} }] },
       {
         role: "toolResult",
         toolCallId: "call_1",
@@ -291,7 +297,7 @@ describe("transformMessagesForQoder", () => {
       },
     ] as unknown as Message[];
     const result = transformMessagesForQoder(msgs);
-    const parts = result[1].content as Array<{ type: string; text?: string; image_url?: { url: string } }>;
+    const parts = result[2].content as Array<{ type: string; text?: string; image_url?: { url: string } }>;
     expect(parts[0].text).toBe("[2 images returned by the previous tool call]");
     expect(parts[1].image_url?.url).toBe("data:image/png;base64,one");
     expect(parts[2].image_url?.url).toBe("data:image/jpeg;base64,two");
@@ -300,6 +306,7 @@ describe("transformMessagesForQoder", () => {
   it("adds no extra message when a tool result has no images", () => {
     // The common case by far; it must stay a single `tool` message.
     const msgs = [
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "read", arguments: {} }] },
       {
         role: "toolResult",
         toolCallId: "call_1",
@@ -307,8 +314,8 @@ describe("transformMessagesForQoder", () => {
       },
     ] as unknown as Message[];
     const result = transformMessagesForQoder(msgs);
-    expect(result).toHaveLength(1);
-    expect(result[0].role).toBe("tool");
+    expect(result).toHaveLength(2);
+    expect(result[1].role).toBe("tool");
   });
 
   it("handles assistant message with string content", () => {
@@ -457,6 +464,59 @@ describe("transformMessagesForQoder", () => {
     for (const m of result) {
       const tm = m as { role: string; tool_call_id?: string };
       if (tm.role === "tool") expect(declared.has(tm.tool_call_id as string)).toBe(true);
+    }
+  });
+
+  it("never emits a `tool` message whose id no preceding assistant turn declared", () => {
+    // Upstreams reject the whole request with "tool must follow a message with
+    // tool_calls" otherwise, which killed every later turn in the session. Each
+    // case below used to leak an orphan `tool` message:
+    //  - a result with no preceding assistant (session resumed mid-turn),
+    //  - a result separated from its call by a user turn,
+    //  - a call the lookahead above trimmed because its result never arrived.
+    const cases: Array<{ name: string; msgs: unknown[] }> = [
+      {
+        name: "result with no preceding assistant",
+        msgs: [
+          { role: "user", content: "hi" },
+          { role: "toolResult", toolCallId: "orphan", content: "x" },
+        ],
+      },
+      {
+        name: "result separated from its call by a user turn",
+        msgs: [
+          { role: "user", content: "hi" },
+          {
+            role: "assistant",
+            content: [
+              { type: "toolCall", id: "a", name: "read", arguments: {} },
+              { type: "toolCall", id: "b", name: "read", arguments: {} },
+            ],
+          },
+          { role: "toolResult", toolCallId: "a", content: "A" },
+          { role: "user", content: "mid" },
+          { role: "toolResult", toolCallId: "b", content: "B" },
+        ],
+      },
+      {
+        name: "session starts with a tool result",
+        msgs: [
+          { role: "toolResult", toolCallId: "x", content: "r" },
+          { role: "user", content: "hi" },
+        ],
+      },
+    ];
+
+    for (const { name, msgs } of cases) {
+      const result = transformMessagesForQoder(msgs as unknown as Message[]);
+      const declared = new Set(
+        result.flatMap((m) => (m as { tool_calls?: Array<{ id: string }> }).tool_calls?.map((t) => t.id) ?? []),
+      );
+      for (const m of result) {
+        const tm = m as { role: string; tool_call_id?: string };
+        if (tm.role !== "tool") continue;
+        expect(declared.has(tm.tool_call_id as string), `${name}: orphan tool_call_id ${tm.tool_call_id}`).toBe(true);
+      }
     }
   });
 

@@ -9,6 +9,7 @@ import type {
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import { stripDsmlResidue } from "./thinking.js";
+import { createQoderToolCallIdMapper } from "./tool-call-id.js";
 
 /** OpenAI-style tool definition sent to the Qoder API. */
 interface QoderTool {
@@ -60,6 +61,9 @@ export function getContentImages(msg: Message): ImageContent[] {
   return msg.content.filter((c): c is ImageContent => c.type === "image");
 }
 
+// fork: tools are resolved from the transcript system messages when the host
+// passes a flat Context. Upstream resolves tools through pi-ai's transcript
+// helpers instead.
 export function extractTools(context: { tools?: Tool[]; messages?: Message[] }): Tool[] {
   if (Array.isArray(context.tools) && context.tools.length > 0) {
     return context.tools;
@@ -93,6 +97,7 @@ export function transformTools(tools: Tool[]): QoderTool[] {
 
 export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
   const normalizedMessages: QoderMessage[] = [];
+  const mapToolCallId = createQoderToolCallIdMapper();
 
   // Dropping an assistant turn (below) also invalidates its tool calls: the
   // result that follows would refer to a tool_calls entry that is no longer in
@@ -193,7 +198,7 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
           } else if (block.type === "toolCall") {
             const tc = block as ToolCall;
             toolCalls.push({
-              id: tc.id,
+              id: mapToolCallId(tc.id),
               type: "function",
               function: {
                 name: tc.name,
@@ -255,10 +260,19 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
       normalizedMessages.push(mapped);
     } else if (msg.role === "toolResult") {
       const prevMessage = normalizedMessages[normalizedMessages.length - 1];
+      // Only a tool result whose id the IMMEDIATELY preceding assistant turn
+      // declared may be emitted. Anything else is an orphan the upstream rejects
+      // with "tool must follow a message with tool_calls":
+      //  - the assistant turn was dropped above (aborted/error),
+      //  - a user message sits between the call and its result,
+      //  - the session resumed mid-turn and the first message is a result,
+      //  - the lookahead above already trimmed that call out of tool_calls.
+      // Null here means "no assistant to pair with", which is not permission to
+      // pass the result through.
       const validDeclaredIds =
         prevMessage?.role === "assistant" && prevMessage.tool_calls
           ? new Set(prevMessage.tool_calls.map((tc) => tc.id).filter((id): id is string => !!id))
-          : null;
+          : new Set<string>();
 
       const collectedImages: ImageContent[] = [];
       let toolCount = 0;
@@ -272,7 +286,6 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
         if (validDeclaredIds && !validDeclaredIds.has(tr.toolCallId)) {
           continue;
         }
-
         toolCount++;
         const textResult = getContentText(tr);
         const images = getContentImages(tr);
@@ -280,7 +293,7 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
 
         normalizedMessages.push({
           role: "tool",
-          tool_call_id: tr.toolCallId,
+          tool_call_id: mapToolCallId(tr.toolCallId),
           content: toolContent,
         });
 

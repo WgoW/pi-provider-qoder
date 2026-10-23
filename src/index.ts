@@ -21,7 +21,7 @@ import {
 } from "./catalog.js";
 import { registerQoderCreditDisplay } from "./credit-display.js";
 import { streamQoder } from "./protocol/stream.js";
-import { getQoderBaseUrl, getQoderRegionConfig, QODER_MODES, type QoderMode } from "./region.js";
+import { getQoderBaseUrl, getQoderRegionConfig, isProviderOfMode, QODER_MODES, type QoderMode } from "./region.js";
 
 // pi supports a `fetchUsage` hook on the oauth config at runtime, but it is not
 // part of the published ProviderConfig type. Declare the extension locally.
@@ -31,8 +31,36 @@ type OAuthConfigWithUsage = NonNullable<ProviderConfig["oauth"]> & {
 
 type AccountLoginHandler = (providerID: string) => void;
 
+// fork: multi-account registration. Upstream registers a single `qoder` /
+// `qoder-cn` provider; this fork registers `qoder-2`..`qoder-10` progressively as
+// each earlier account logs in, and keeps the registration record per pi
+// instance so a replaced session registers from scratch (issue #1).
 const MAX_QODER_ACCOUNTS = 10;
-const registeredAccountProviderIDs = new Set<string>();
+
+/**
+ * Provider ids already registered, tracked per pi instance.
+ *
+ * This MUST be keyed by instance, not a module-level Set. ESM modules stay
+ * cached across session replacement, so a module-level set made every later
+ * session skip `pi.registerProvider()` entirely: `/resume`, `/new` and `/fork`
+ * built a fresh ModelRuntime with zero Qoder providers, the picker fell back to
+ * the default model, and the same happened when the official loader loaded the
+ * built package a second time in one process.
+ *
+ * A WeakMap keeps the dedupe within one pi (registerProvider repeatedly for the
+ * same id would stack duplicates) while letting a replaced instance register
+ * from scratch, and it does not retain dead instances.
+ */
+const registeredProvidersByPi = new WeakMap<ExtensionAPI, Set<string>>();
+
+function registeredProviderIDs(pi: ExtensionAPI): Set<string> {
+  let ids = registeredProvidersByPi.get(pi);
+  if (!ids) {
+    ids = new Set<string>();
+    registeredProvidersByPi.set(pi, ids);
+  }
+  return ids;
+}
 
 const QODER_API = "qoder-api" as Api;
 
@@ -116,10 +144,11 @@ function registerNextAccountProvider(pi: ExtensionAPI, accountNumber: number, mo
 
   const providerID = accountProviderID(mode, accountNumber);
   const previousProviderID = accountProviderID(mode, accountNumber - 1);
-  if (registeredAccountProviderIDs.has(providerID)) return;
+  const registered = registeredProviderIDs(pi);
+  if (registered.has(providerID)) return;
   if (!getCachedCredentials("", previousProviderID)?.access) return;
 
-  registeredAccountProviderIDs.add(providerID);
+  registered.add(providerID);
   registerQoderProvider(pi, providerID, mode, () => {
     registerNextAccountProvider(pi, accountNumber + 1, mode);
   });
@@ -127,18 +156,18 @@ function registerNextAccountProvider(pi: ExtensionAPI, accountNumber: number, mo
 
 function registerAccountProvider(pi: ExtensionAPI, accountNumber: number, mode: QoderMode): void {
   const providerID = accountProviderID(mode, accountNumber);
-  if (registeredAccountProviderIDs.has(providerID)) return;
+  const registered = registeredProviderIDs(pi);
+  if (registered.has(providerID)) return;
 
-  registeredAccountProviderIDs.add(providerID);
+  registered.add(providerID);
   registerQoderProvider(pi, providerID, mode, () => {
     registerNextAccountProvider(pi, accountNumber + 1, mode);
   });
 }
 
 function reRegisterProvidersForMode(pi: ExtensionAPI, mode: QoderMode): void {
-  const prefix = getQoderRegionConfig(mode).providerID;
-  for (const providerID of registeredAccountProviderIDs) {
-    if (providerID === prefix || providerID.startsWith(`${prefix}-`)) {
+  for (const providerID of registeredProviderIDs(pi)) {
+    if (isProviderOfMode(providerID, mode)) {
       registerQoderProvider(pi, providerID, mode);
     }
   }
@@ -294,6 +323,14 @@ export default async function (pi: ExtensionAPI) {
     // boundary. Doing this before a request could bypass the pool for that
     // request if handler ordering were reversed.
     reRegisterIfCatalogChanged();
+  });
+
+  pi.on("session_shutdown", () => {
+    // Drop this instance's registration record. The next session gets a fresh
+    // pi (and ModelRuntime), so it must register providers from scratch instead
+    // of inheriting a stale "already registered" set — the /resume, /new and
+    // /fork model-disappearing bug (issue #1).
+    registeredProvidersByPi.delete(pi);
   });
 
   registerQoderCreditDisplay(pi);

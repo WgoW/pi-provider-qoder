@@ -91,6 +91,37 @@ describe("listQoderAccounts", () => {
     // CN credentials never leak into the global list.
     expect(listQoderAccounts("cn")).toEqual([]);
   });
+
+  it("keeps regions apart when both are configured", () => {
+    // The global provider id ("qoder") is a strict prefix of the CN one
+    // ("qoder-cn"), so a plain `id.startsWith(`${prefix}-`)` test matched CN
+    // slots when listing global accounts. That made a global catalogue refresh
+    // call /model/list with CN credentials (against the GLOBAL endpoint) and
+    // write the CN account into the global cache.
+    writeFileSync(
+      AUTH_FILE,
+      JSON.stringify({
+        qoder: credential("global-user", "global-token"),
+        "qoder-2": credential("global-user-2", "global-token-2"),
+        "qoder-cn": credential("cn-user", "cn-token"),
+        "qoder-cn-2": credential("cn-user-2", "cn-token-2"),
+      }),
+      "utf8",
+    );
+    writeFileSync(MULTI_FILE, JSON.stringify({ version: 1, providers: {} }), "utf8");
+    clearQoderAuthMemCache();
+
+    expect(
+      listQoderAccounts("global")
+        .map((a) => a.providerID)
+        .sort(),
+    ).toEqual(["qoder", "qoder-2"]);
+    expect(
+      listQoderAccounts("cn")
+        .map((a) => a.providerID)
+        .sort(),
+    ).toEqual(["qoder-cn", "qoder-cn-2"]);
+  });
 });
 
 describe("account catalogue refresh", () => {

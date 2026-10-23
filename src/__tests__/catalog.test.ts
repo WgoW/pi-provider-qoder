@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildThinkingConfig,
   contextWindowFromCatalog,
   DEFAULT_CONTEXT_WINDOW,
   getCachedModelConfig,
@@ -167,5 +168,65 @@ describe("ZERO_COST", () => {
 
   it("is frozen", () => {
     expect(Object.isFrozen(ZERO_COST)).toBe(true);
+  });
+});
+
+// ── buildThinkingConfig (omp effort picker) ────────────────────────────────
+
+// omp populates its effort picker from `model.thinking`, not from the
+// `thinkingLevelMap` that earendil pi-ai reads. Without this field omp falls
+// back to a generic minimal..high ladder, so DeepSeek-V4-Pro would offer levels
+// it does not support and hide `max` (upstream #42). earendil pi ignores it.
+describe("buildThinkingConfig", () => {
+  it("maps an effort-based model with a disabled branch", () => {
+    const entry = {
+      thinking_config: {
+        disabled: { description: "Disable thinking" },
+        enabled: {
+          efforts: { high: {}, max: { is_default: true } },
+          is_default: true,
+        },
+      },
+    };
+    expect(buildThinkingConfig(entry)).toEqual({
+      mode: "effort",
+      efforts: ["high", "max"],
+      defaultLevel: "max",
+      requiresEffort: false,
+    });
+  });
+
+  it("marks reasoning mandatory when there is no disabled branch", () => {
+    const entry = {
+      thinking_config: {
+        enabled: {
+          efforts: { high: {}, max: { is_default: true } },
+          is_default: true,
+        },
+      },
+    };
+    expect(buildThinkingConfig(entry)).toMatchObject({
+      mode: "effort",
+      efforts: ["high", "max"],
+      defaultLevel: "max",
+      requiresEffort: true,
+    });
+  });
+
+  it("orders efforts least to most intensive", () => {
+    const entry = {
+      thinking_config: {
+        enabled: {
+          efforts: { xhigh: {}, high: { is_default: true }, low: {}, max: {}, medium: {} },
+          is_default: true,
+        },
+      },
+    };
+    expect(buildThinkingConfig(entry)?.efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+
+  it("returns undefined for toggle-only models and non-reasoning entries", () => {
+    expect(buildThinkingConfig({ thinking_config: { enabled: { is_default: true } } })).toBeUndefined();
+    expect(buildThinkingConfig({})).toBeUndefined();
   });
 });

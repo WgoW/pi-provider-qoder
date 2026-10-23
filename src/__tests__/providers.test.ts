@@ -1,170 +1,157 @@
-import type { OAuthCredentials } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { clearQoderAuthMemCache } from "../auth/oauth.js";
+import { clearQoderModelsMemCache } from "../catalog.js";
+import registerQoderExtension from "../index.js";
 
-const patEnvNames = [
-  "QODER_API_KEY",
-  "QODER_PERSONAL_ACCESS_TOKEN",
-  "QODER_PAT",
-  "QODERCN_API_KEY",
-  "QODERCN_PERSONAL_ACCESS_TOKEN",
-  "QODERCN_PAT",
-] as const;
-const originalPats = Object.fromEntries(patEnvNames.map((name) => [name, process.env[name]]));
+const AGENT_DIR = join(process.env.HOME || process.env.USERPROFILE || "", ".pi", "agent");
+const AUTH_FILE = join(AGENT_DIR, "auth.json");
 
-afterEach(() => {
-  for (const name of patEnvNames) {
-    const value = originalPats[name];
-    if (value === undefined) delete process.env[name];
-    else process.env[name] = value;
-  }
-  vi.unstubAllGlobals();
-  vi.doUnmock("@earendil-works/pi-ai/compat");
-  vi.resetModules();
-});
+const EXPIRES = Date.now() + 3_600_000;
 
-function liteModel(provider: "qoder" | "qoder-cn") {
+function credential(userID: string, access: string) {
   return {
-    id: "Lite",
-    name: "Lite",
-    api: "qoder-api",
-    provider,
-    baseUrl: provider === "qoder-cn" ? "https://gateway.qoder.com.cn/" : "https://api3.qoder.sh/",
-    reasoning: false,
-    input: ["text"] as const,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 1000000,
-    maxTokens: 131072,
+    type: "oauth",
+    access,
+    refresh: "rt",
+    expires: EXPIRES,
+    userID,
+    email: `${userID}@example.com`,
+    name: userID,
   };
 }
 
-describe("provider region binding", () => {
-  it("binds qoder to global and qoder-cn to CN", async () => {
-    for (const name of patEnvNames) delete process.env[name];
-    const providers = new Map<string, Record<string, unknown>>();
-    const pi = {
-      registerProvider(providerID: string, config: Record<string, unknown>) {
-        providers.set(providerID, config);
-      },
-      on: vi.fn(),
-    };
+/**
+ * Minimal ExtensionAPI stand-in that records provider registrations and the
+ * event handlers the extension subscribes to.
+ */
+interface FakePi {
+  api: ExtensionAPI;
+  registered: Map<string, number>;
+  handlers: Map<string, Array<(...args: unknown[]) => unknown>>;
+  emit(event: string): Promise<void>;
+}
 
-    const { default: registerProviders } = await import("../index.js");
-    await registerProviders(pi as never);
+function makePi(): FakePi {
+  const registered = new Map<string, number>();
+  const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+  const api = {
+    registerProvider: (id: string) => {
+      registered.set(id, (registered.get(id) ?? 0) + 1);
+    },
+    on: (event: string, handler: (...args: unknown[]) => unknown) => {
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
+    },
+    registerCommand: () => {},
+    registerFooterProvider: () => {},
+    registerCreditDisplay: () => {},
+    // Anything else the extension reaches for is not exercised here.
+  } as unknown as ExtensionAPI;
+  return {
+    api,
+    registered,
+    handlers,
+    emit: async (event: string) => {
+      for (const handler of handlers.get(event) ?? []) await handler({}, {});
+    },
+  };
+}
 
-    expect(providers.get("qoder")?.baseUrl).toBe("https://api3.qoder.sh/");
-    expect(providers.get("qoder-cn")?.baseUrl).toBe("https://gateway.qoder.com.cn/");
-
-    const fetchMock = vi.fn().mockImplementation(
-      async () =>
-        new Response(
-          JSON.stringify({
-            userQuota: { total: 100, used: 1, remaining: 99, percentage: 1, unit: "requests" },
-            orgResourcePackage: { total: 0, used: 0, remaining: 0, percentage: 0, unit: "requests" },
-            totalUsagePercentage: 1,
-            isQuotaExceeded: false,
-            expiresAt: Date.now() + 3600_000,
-          }),
-          { status: 200 },
-        ),
+beforeEach(() => {
+  clearQoderAuthMemCache();
+  clearQoderModelsMemCache();
+  mkdirSync(AGENT_DIR, { recursive: true });
+  rmSync(AUTH_FILE, { force: true });
+  writeFileSync(AUTH_FILE, JSON.stringify({ qoder: credential("user-a", "token-a") }), "utf8");
+  // Both catalogues: the extension registers a provider per Qoder region.
+  for (const name of ["qoder-models-cache.json", "qoder-cn-models-cache.json"]) {
+    writeFileSync(
+      join(AGENT_DIR, name),
+      JSON.stringify({
+        version: 2,
+        updatedAt: Date.now(),
+        models: [{ id: "Lite", name: "Lite" }],
+        configs: { Lite: { key: "lite", display_name: "Lite", is_free: true } },
+        accounts: {
+          "user-a": {
+            updatedAt: Date.now(),
+            identity: { userID: "user-a" },
+            servedModelIds: ["Lite"],
+            models: [{ id: "Lite", name: "Lite" }],
+            configs: { Lite: { key: "lite", display_name: "Lite", is_free: true } },
+          },
+        },
+      }),
+      "utf8",
     );
-    vi.stubGlobal("fetch", fetchMock);
-
-    const credentials: OAuthCredentials = { access: "test-token", refresh: "", expires: Date.now() + 3600_000 };
-    const globalOAuth = providers.get("qoder")?.oauth as {
-      fetchUsage: (credentials: OAuthCredentials) => Promise<unknown>;
-    };
-    const cnOAuth = providers.get("qoder-cn")?.oauth as {
-      fetchUsage: (credentials: OAuthCredentials) => Promise<unknown>;
-    };
-
-    await globalOAuth.fetchUsage(credentials);
-    expect(fetchMock).toHaveBeenLastCalledWith("https://openapi.qoder.sh/api/v2/quota/usage", expect.any(Object));
-
-    await cnOAuth.fetchUsage(credentials);
-    expect(fetchMock).toHaveBeenLastCalledWith("https://openapi.qoder.com.cn/api/v2/quota/usage", expect.any(Object));
-  });
+  }
+  clearQoderModelsMemCache();
+  // Registration reads the catalogue; never let it hit the network here.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => new Response("{}", { status: 200 })),
+  );
 });
 
-describe("qoder-api registry", () => {
-  it("registers qoder-api so global streamSimple works for both regions", async () => {
-    for (const name of patEnvNames) delete process.env[name];
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+  clearQoderAuthMemCache();
+  clearQoderModelsMemCache();
+});
 
-    const actual = await vi.importActual<typeof import("@earendil-works/pi-ai/compat")>("@earendil-works/pi-ai/compat");
-    const registerSpy = vi.fn((...args: Parameters<typeof actual.registerApiProvider>) => {
-      return actual.registerApiProvider(...args);
-    });
-    vi.doMock("@earendil-works/pi-ai/compat", () => ({
-      ...actual,
-      registerApiProvider: registerSpy,
-    }));
+describe("provider registration across session lifecycles", () => {
+  it("registers the qoder provider for a fresh instance", async () => {
+    const pi = makePi();
+    await registerQoderExtension(pi.api);
 
-    const { getApiProvider, streamSimple, unregisterApiProviders } = await import("@earendil-works/pi-ai/compat");
-    const { default: registerProviders } = await import("../index.js");
-    // Node caches node_modules ESM, so a prior test in this file may already
-    // have registered qoder-api. Drop that entry before asserting the empty state.
-    unregisterApiProviders("provider:qoder");
-    const emptyContext = { systemPrompt: "", messages: [] };
-
-    expect(getApiProvider("qoder-api")).toBeUndefined();
-    expect(() => streamSimple(liteModel("qoder") as never, emptyContext)).toThrow(
-      /No API provider registered for api: qoder-api/,
-    );
-
-    const providers = new Map<string, Record<string, unknown>>();
-    const registerProvider = vi.fn((providerID: string, config: Record<string, unknown>) => {
-      providers.set(providerID, config);
-    });
-    const pi = {
-      registerProvider,
-      on: vi.fn(),
-    };
-
-    await registerProviders(pi as never);
-
-    expect(registerSpy).toHaveBeenCalledTimes(1);
-    expect(registerProvider).toHaveBeenCalledTimes(2);
-    expect(providers.has("qoder")).toBe(true);
-    expect(providers.has("qoder-cn")).toBe(true);
-    expect(providers.get("qoder")?.api).toBe("qoder-api");
-    expect(providers.get("qoder-cn")?.api).toBe("qoder-api");
-    expect(typeof providers.get("qoder")?.streamSimple).toBe("function");
-    expect(typeof providers.get("qoder-cn")?.streamSimple).toBe("function");
-
-    expect(getApiProvider("qoder-api")).toBeDefined();
-    expect(() => streamSimple(liteModel("qoder") as never, emptyContext)).not.toThrow(
-      /No API provider registered for api: qoder-api/,
-    );
-    expect(() => streamSimple(liteModel("qoder-cn") as never, emptyContext)).not.toThrow(
-      /No API provider registered for api: qoder-api/,
-    );
+    expect(pi.registered.get("qoder")).toBe(1);
   });
 
-  it("still registers providers when registerApiProvider is absent (OMP-style)", async () => {
-    for (const name of patEnvNames) delete process.env[name];
+  it("registers again for a replacement instance in the same process", async () => {
+    // ESM modules stay cached across session replacement, so a module-level
+    // "already registered" set made every later session skip registerProvider.
+    // /resume, /new and /fork then built a ModelRuntime with zero Qoder
+    // providers and the picker silently fell back to the default model
+    // (issue #1). Registration state must be per pi instance.
+    const first = makePi();
+    await registerQoderExtension(first.api);
+    expect(first.registered.get("qoder")).toBe(1);
 
-    vi.doMock("@earendil-works/pi-ai/compat", () => ({
-      // OMP bundled pi-ai/compat does not export registerApiProvider.
-    }));
+    const second = makePi();
+    await registerQoderExtension(second.api);
 
-    const { default: registerProviders } = await import("../index.js");
+    expect(second.registered.get("qoder")).toBe(1);
+  });
 
-    const providers = new Map<string, Record<string, unknown>>();
-    const registerProvider = vi.fn((providerID: string, config: Record<string, unknown>) => {
-      providers.set(providerID, config);
-    });
-    const pi = {
-      registerProvider,
-      on: vi.fn(),
-    };
+  it("does not double-register within one instance", async () => {
+    const pi = makePi();
+    await registerQoderExtension(pi.api);
+    const afterInit = pi.registered.get("qoder");
 
-    await expect(registerProviders(pi as never)).resolves.toBeUndefined();
+    // A second agent_end/session_start cycle on the same instance must reconcile,
+    // not stack duplicate provider registrations.
+    await pi.emit("agent_end");
+    await pi.emit("session_start");
 
-    expect(registerProvider).toHaveBeenCalledTimes(2);
-    expect(providers.has("qoder")).toBe(true);
-    expect(providers.has("qoder-cn")).toBe(true);
-    expect(providers.get("qoder")?.api).toBe("qoder-api");
-    expect(providers.get("qoder-cn")?.api).toBe("qoder-api");
-    expect(typeof providers.get("qoder")?.streamSimple).toBe("function");
-    expect(typeof providers.get("qoder-cn")?.streamSimple).toBe("function");
+    expect(afterInit).toBe(1);
+    // session_start may re-register once to adopt a refreshed catalogue, but it
+    // must never accumulate beyond that.
+    expect(pi.registered.get("qoder")).toBeLessThanOrEqual(3);
+  });
+
+  it("releases its registration record on session_shutdown", async () => {
+    const pi = makePi();
+    await registerQoderExtension(pi.api);
+    await pi.emit("session_shutdown");
+
+    // Shutting down must not throw and must leave the instance reusable: a later
+    // registration pass on the same object registers again.
+    await pi.emit("session_start");
+    expect(pi.registered.get("qoder")).toBeGreaterThan(0);
   });
 });

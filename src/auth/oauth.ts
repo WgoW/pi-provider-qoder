@@ -6,9 +6,9 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-a
 import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import { qoderAccountKey, updateQoderModelsCache } from "../catalog.js";
 import { getMachineId } from "../cosy.js";
-import { getQoderRefreshURL, getQoderRegionConfig, type QoderMode } from "../region.js";
+import { getQoderRefreshURL, getQoderRegionConfig, isProviderOfMode, type QoderMode } from "../region.js";
 import { interactiveLogin } from "./login.js";
-import { credentialsFromPat, decodePatRefresh, fetchUserInfo, isPatRefresh } from "./pat.js";
+import { authFetchSignal, credentialsFromPat, decodePatRefresh, fetchUserInfo, isPatRefresh } from "./pat.js";
 
 export interface QoderCredentials extends OAuthCredentials {
   userID: string;
@@ -136,7 +136,7 @@ export function listQoderAccounts(mode: QoderMode): QoderAccountCredential[] {
 
   const auth = readAuthFileCached();
   for (const [providerID, credential] of Object.entries(auth ?? {})) {
-    if (providerID !== prefix && !providerID.startsWith(`${prefix}-`)) continue;
+    if (!isProviderOfMode(providerID, mode)) continue;
     add(credential as Record<string, unknown>, providerID, "auth");
   }
 
@@ -424,6 +424,9 @@ export async function refreshQoderTokenForMode(
         "User-Agent": "pi-provider-qoder",
       },
       body: JSON.stringify({ refreshToken }),
+      // Refresh also runs on the startup path (and mid-turn on 401); bound it so
+      // an unresponsive center host cannot stall login or a request forever.
+      signal: authFetchSignal(),
     });
 
     if (response.ok) {

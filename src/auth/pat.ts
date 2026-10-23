@@ -5,6 +5,22 @@ import { getQoderExchangeURL, getQoderRegionConfig, getQoderUserInfoURL, type Qo
 const UA = "pi-provider-qoder";
 
 /**
+ * Bound every auth call that sits on pi's startup path.
+ *
+ * The extension's default export awaits automatic login, so an upstream that
+ * accepts the connection and then never answers blocks pi from finishing
+ * load — no models, no UI, no error. These endpoints are small JSON calls, so a
+ * 15s ceiling is generous; on timeout the caller falls back to cached
+ * credentials (or reports a login failure) instead of hanging.
+ */
+const AUTH_FETCH_TIMEOUT_MS = 15_000;
+
+export function authFetchSignal(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(AUTH_FETCH_TIMEOUT_MS);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+/**
  * Marker prefix used in the credential `refresh` field to identify PAT-based
  * credentials. Layout: `pat|<personalToken>|<jobRefreshToken>|<userID>|<machineID>`
  */
@@ -61,6 +77,7 @@ export async function exchangeJobToken(pat: string, mode: QoderMode): Promise<Pa
       "Cosy-ClientType": QODER_CLIENT_TYPE,
     },
     body: JSON.stringify({ personal_token: pat }),
+    signal: authFetchSignal(),
   });
 
   if (!res.ok) {
@@ -112,6 +129,7 @@ export async function fetchUserInfo(
         "Cosy-Version": QODER_OPENAPI_COSY_VERSION,
         "Cosy-ClientType": QODER_CLIENT_TYPE,
       },
+      signal: authFetchSignal(),
     });
     if (res.ok) {
       const info = (await res.json()) as {

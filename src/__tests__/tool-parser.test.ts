@@ -130,3 +130,30 @@ describe("extractTools", () => {
     expect(tools.map((t) => t.name)).toEqual(["bash", "write"]);
   });
 });
+
+describe("parseToolCallsFromText argument shape", () => {
+  it("degrades non-object arguments to an empty object", () => {
+    // ToolCall.arguments is a JsonObject. A model that emits an array, scalar or
+    // null (or a string that is not JSON) used to be passed straight through, so
+    // the resulting tool call failed argument validation instead of running with
+    // no arguments.
+    for (const payload of [
+      '{"name":"a","arguments":[1,2]}',
+      '{"name":"a","arguments":null}',
+      '{"name":"a","arguments":42}',
+      '{"name":"a","arguments":"not json"}',
+    ]) {
+      const { toolCalls } = parseToolCallsFromText(`<tool_call>${payload}</tool_call>`);
+      expect(toolCalls).toHaveLength(1);
+      expect(toolCalls[0].arguments).toEqual({});
+    }
+  });
+
+  it("keeps a well-formed object and a stringified-object argument", () => {
+    const direct = parseToolCallsFromText('<tool_call>{"name":"a","arguments":{"x":1}}</tool_call>');
+    expect(direct.toolCalls[0].arguments).toEqual({ x: 1 });
+
+    const stringified = parseToolCallsFromText('<tool_call>{"name":"a","arguments":"{\\"x\\":2}"}</tool_call>');
+    expect(stringified.toolCalls[0].arguments).toEqual({ x: 2 });
+  });
+});
