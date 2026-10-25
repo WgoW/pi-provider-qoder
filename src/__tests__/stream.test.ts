@@ -256,6 +256,14 @@ describe("streamQoder", () => {
     expect(body.model_config.key).toBe("lite");
   });
 
+  it("uses the China-specific session type for CN requests", async () => {
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(streamQoder(makeModel("qoder-cn", "DeepSeek-V4-Flash"), makeContext(), { apiKey: "fake" }));
+
+    const body = decodeQoderBody(vi.mocked(globalThis.fetch).mock.calls[0][1]);
+    expect(body.session_type).toBe("qoderclicn");
+  });
+
   it("sends full disable signals when thinking is off", async () => {
     globalThis.fetch = mockFetch(SUCCESS_SSE);
     const offOptions = { apiKey: "fake", reasoning: "off" } as unknown as Parameters<typeof streamQoder>[2];

@@ -33,14 +33,15 @@ import { extractTools, transformMessagesForQoder, transformTools } from "./trans
 
 /**
  * Qoder's scheduler reports a busy model as error code 10605. The official
- * client treats `isQueued:false` + `serviceAvailable:true` as "ready" and
- * re-sends the request after `retryAfterSeconds`; without that recovery one
- * transient rejection kills the whole turn. We mirror the bounded part of it.
+ * client may return either a ready-to-retry snapshot or an explicitly queued
+ * snapshot (`isQueued:true`, `serviceAvailable:false`). Both are transient
+ * and must honor `retryAfterSeconds`; otherwise a real queue rejection kills
+ * the whole turn even though the request could have succeeded moments later.
  */
 const MODEL_BUSY_CODE = "10605";
-const DEFAULT_MODEL_BUSY_RETRIES = 2;
+const DEFAULT_MODEL_BUSY_RETRIES = 10;
 const MAX_MODEL_BUSY_RETRIES = 10;
-const MODEL_BUSY_MAX_WAIT_MS = 5_000;
+const MODEL_BUSY_MAX_WAIT_MS = 540_000;
 
 /** A recovery-eligible "model busy" rejection from Qoder's queue scheduler. */
 class QoderModelBusyError extends Error {
@@ -79,10 +80,11 @@ function parseJsonObject(value: unknown, depth = 0): Record<string, unknown> | u
  * Envelope body shape (three nested JSON layers):
  *   {code:"403",message:"{\"code\":\"10605\",\"message\":\"{\\\"isQueued\\\":false,...}\",\"subCode\":\"RESOURCE_LIMIT\"}"}
  *
- * Only the documented 10605 code and the observed ready combination
- * (`isQueued:false` + `serviceAvailable:true`) are eligible. A real queue
- * (`isQueued:true`), missing flags, or any other code keep the previous
- * failure behavior. `subCode` is diagnostic only — it is not a retry signal.
+ * Both documented transient combinations are eligible:
+ * `isQueued:false` + `serviceAvailable:true` (retry when the slot opens) and
+ * `isQueued:true` + `serviceAvailable:false` (already waiting in the queue).
+ * Missing flags, `isQueued:false` + `serviceAvailable:false`, or any other
+ * code keep the failure behavior. `subCode` is diagnostic only.
  */
 export function parseModelBusyRejection(body: unknown): ModelBusyQueueSnapshot | undefined {
   const outer = parseJsonObject(body);
@@ -90,7 +92,9 @@ export function parseModelBusyRejection(body: unknown): ModelBusyQueueSnapshot |
   if (busy?.code !== MODEL_BUSY_CODE) return undefined;
   const queue = parseJsonObject(busy.message);
   if (!queue) return undefined;
-  if (queue.isQueued !== false || queue.serviceAvailable !== true) return undefined;
+  const readyToRetry = queue.isQueued === false && queue.serviceAvailable === true;
+  const queued = queue.isQueued === true && queue.serviceAvailable === false;
+  if (!readyToRetry && !queued) return undefined;
   const seconds = queue.retryAfterSeconds;
   const retryAfterMs =
     typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds * 1000) : 0;
@@ -731,7 +735,7 @@ export function streamQoder(
         is_retry: false,
         source: 1,
         version: "3",
-        session_type: "qodercli",
+        session_type: providerMode === "cn" ? "qoderclicn" : "qodercli",
         agent_id: "agent_common",
         task_id: "common",
         code_language: "",
@@ -777,7 +781,7 @@ export function streamQoder(
       const modelSource = modelConfig.source || "system";
 
       // A caller-provided retry budget (including an explicit 0) wins; otherwise
-      // retry twice, capped at qodercli's own recovery limit. Non-finite values
+      // retry up to the bounded queue budget. Non-finite values
       // fall back to the default so the caps stay finite.
       const requestedRetries = options?.maxRetries;
       const modelBusyRetries = Math.min(
@@ -790,8 +794,8 @@ export function streamQoder(
         MAX_MODEL_BUSY_RETRIES,
       );
       // pi's contract: `maxRetryDelayMs: 0` disables the caller cap. The
-      // provider's own 5s cap still applies, so a positive retryAfterSeconds is
-      // never truncated to zero.
+      // provider still enforces a bounded ceiling so a bad server hint cannot
+      // block a session indefinitely.
       const requestedMaxWaitMs = options?.maxRetryDelayMs;
       const modelBusyMaxWaitMs =
         typeof requestedMaxWaitMs === "number" && Number.isFinite(requestedMaxWaitMs) && requestedMaxWaitMs > 0

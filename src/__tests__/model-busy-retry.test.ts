@@ -164,8 +164,10 @@ describe("parseModelBusyRejection", () => {
     expect(parseModelBusyRejection(busyBody({ retryAfterSeconds: 2 }))).toEqual({ retryAfterMs: 2000 });
   });
 
-  it("rejects a real queue instead of treating it as ready", () => {
-    expect(parseModelBusyRejection(busyBody({ isQueued: true }))).toBeUndefined();
+  it("accepts a real queued rejection and preserves its retry hint", () => {
+    expect(parseModelBusyRejection(busyBody({ isQueued: true, serviceAvailable: false }))).toEqual({
+      retryAfterMs: 2000,
+    });
   });
 
   it("rejects a snapshot without the ready flags", () => {
@@ -249,10 +251,10 @@ describe("streamQoder model-busy recovery", () => {
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
     const message = errorOf(events);
 
-    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(11);
     expect(message.errorMessage).toMatch(/model is busy/);
     expect(message.errorMessage).toMatch(/10605/);
-    expect(message.errorMessage).toMatch(/attempts=3/);
+    expect(message.errorMessage).toMatch(/attempts=11/);
     expect(isRetryableAssistantError(message)).toBe(true);
   });
 
@@ -269,13 +271,13 @@ describe("streamQoder model-busy recovery", () => {
   });
 
   it("stops local recovery when the server asks for longer than the local cap", async () => {
-    globalThis.fetch = mockFetchSequence([busySse({ retryAfterSeconds: 30 })]);
+    globalThis.fetch = mockFetchSequence([busySse({ retryAfterSeconds: 600 })]);
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
     const message = errorOf(events);
 
     expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(1);
-    expect(message.errorMessage).toMatch(/requested delay 30000ms/);
-    expect(message.errorMessage).toMatch(/exceeds local cap 5000ms/);
+    expect(message.errorMessage).toMatch(/requested delay 600000ms/);
+    expect(message.errorMessage).toMatch(/exceeds local cap 540000ms/);
     expect(isRetryableAssistantError(message)).toBe(true);
   });
 
@@ -286,7 +288,7 @@ describe("streamQoder model-busy recovery", () => {
     expect(errorOf(events).errorMessage).toMatch(/exceeds local cap 1000ms/);
   });
 
-  it("treats maxRetryDelayMs:0 as no caller cap, keeping the 5s hard cap", async () => {
+  it("treats maxRetryDelayMs:0 as no caller cap, keeping the 9m hard cap", async () => {
     globalThis.fetch = mockFetchSequence([busySse({ retryAfterSeconds: 0.001 }), SUCCESS_SSE]);
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", maxRetryDelayMs: 0 }));
 
@@ -295,30 +297,29 @@ describe("streamQoder model-busy recovery", () => {
   });
 
   it("falls back to the hard cap for a non-finite maxRetryDelayMs", async () => {
-    globalThis.fetch = mockFetchSequence([busySse({ retryAfterSeconds: 30 })]);
+    globalThis.fetch = mockFetchSequence([busySse({ retryAfterSeconds: 600 })]);
     const events = await consume(
       streamQoder(makeModel(), makeContext(), { apiKey: "fake", maxRetryDelayMs: Number.NaN }),
     );
 
     expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(1);
-    expect(errorOf(events).errorMessage).toMatch(/exceeds local cap 5000ms/);
+    expect(errorOf(events).errorMessage).toMatch(/exceeds local cap 540000ms/);
   });
 
   it("falls back to the default retry budget for a non-finite maxRetries", async () => {
     globalThis.fetch = mockFetchSequence([busySse({ retryAfterSeconds: 0 })]);
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", maxRetries: Number.NaN }));
 
-    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(3);
-    expect(errorOf(events).errorMessage).toMatch(/attempts=3/);
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(11);
+    expect(errorOf(events).errorMessage).toMatch(/attempts=11/);
   });
 
-  it("keeps the previous behavior for a real queue", async () => {
-    globalThis.fetch = mockFetchSequence([busySse({ isQueued: true }), SUCCESS_SSE]);
+  it("retries a real queued rejection and streams the retried reply", async () => {
+    globalThis.fetch = mockFetchSequence([busySse({ isQueued: true, serviceAvailable: false }), SUCCESS_SSE]);
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
-    const message = errorOf(events);
 
-    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(1);
-    expect(message.errorMessage).toMatch(/Upstream status 403/);
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(2);
+    expect(doneOf(events).content.find((c) => c.type === "text")).toMatchObject({ text: "pong" });
   });
 
   it("keeps the previous behavior when only subCode matches", async () => {
@@ -565,6 +566,6 @@ describe("harness retry integration", () => {
 
     expect(result.stopReason).toBe("error");
     expect(result.errorMessage).toMatch(/model is busy/);
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(11);
   });
 });
