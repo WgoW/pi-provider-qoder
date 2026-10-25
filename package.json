@@ -43,7 +43,7 @@
     "format": "node node_modules/@biomejs/biome/bin/biome format --write .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepare": "npm run build",
+    "prepare": "npm run build:bundle",
     "prepublishOnly": "npm run check && npm run build",
     "demo:credits": "tsx scripts/demo-credit-footer.ts",
     "test:live": "tsx scripts/record-live-fixtures.ts",
